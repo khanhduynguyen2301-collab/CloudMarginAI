@@ -77,4 +77,4 @@ Core workflows: continuous monitoring → incident investigation → approval �
 - [x] Reviewed against scope table, principles, and non-goals
 - [x] Personas confirmed as four separate RBAC-enforced demo accounts (not a role-switcher)
 - [x] Business outcomes trimmed to 5 named, measurable metrics (MTTD; MTTR-cause + Top-3/MRR; avoidable cost + guardrail violations; evidence-grounding + rollback completeness; estimated vs. realized savings) — finance/margin outcome deferred
-- [ ] Approved to proceed to Phase 1 (data simulator)
+- [x] Approved to proceed to Phase 1 (data simulator) — approved by Khanh Duy, 2026-09-07
