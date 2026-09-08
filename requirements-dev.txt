@@ -1,0 +1,13 @@
+# CloudMargin AI — development/test dependencies
+#
+# Install with:  pip install -r requirements-dev.txt
+# (pulls in requirements.txt too)
+
+-r requirements.txt
+
+pytest==9.1.1       # tests/test_seeding.py, tests/test_topology.py, and the
+                    # causal sanity checks that will live in tests/data/
+                    # (docs/phase1/validation-plan.md)
+
+# Worth adding once there's enough code to be worth linting:
+# ruff==0.16.6
