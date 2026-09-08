@@ -1,0 +1,29 @@
+# CloudMargin AI — runtime dependencies
+#
+# Scope: Phase 1 (data simulator) only. Later phases add their own — Phase 2
+# needs scikit-learn, Phase 4 the Vertex AI SDK, Phase 5 FastAPI — and they
+# get added when those phases actually start, not now. Installing a stack you
+# aren't running yet contradicts the project's own cost-discipline principle
+# (docs/CloudMargin blueprint §17) and makes the venv slower to rebuild.
+#
+# WHY EXACT PINS (==) AND NOT RANGES (>=):
+# Phase 1's exit gate is a byte-identical rerun from a fixed seed
+# (docs/phase1/validation-plan.md, "Reproducibility test"). NumPy explicitly
+# does NOT guarantee that `np.random.Generator` produces identical streams
+# across feature releases — per NEP 19, only the legacy `RandomState` is
+# frozen; Generator's stream may change when an algorithm is improved or a bug
+# is fixed. So `simulate --seed 42` is only reproducible *within a pinned
+# environment*. Loosen these pins and the exit-gate test can start failing on
+# a machine that merely ran `pip install -U`.
+#
+# After installing, freeze the full resolved tree so transitive deps are
+# pinned too:
+#     pip freeze > requirements.lock.txt
+
+numpy==2.4.6        # RNG (simulator/seeding.py) + all generator math
+pandas==3.0.5       # hourly time-indexed frames for every table
+pyarrow==25.0.1     # parquet output for the 5 analytical tables + ground truth
+
+# Optional — only if you decide simulate --config takes YAML rather than JSON
+# (json is stdlib, so the default costs nothing):
+# pyyaml==6.0.3
