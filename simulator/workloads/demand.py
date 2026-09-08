@@ -15,7 +15,7 @@ growth_rate: 0.5%-1.5% per week, service-dependent.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import numpy as np
@@ -138,6 +138,38 @@ SERVICE_DEMAND_PARAMS: dict[str, DemandParams] = {
 # noise/contrast, per simulator-architecture.md, not to carry incidents.
 STAGING_SCALE = 0.04
 
+
+def params_for(service: Service) -> DemandParams:
+    """Resolve the demand constants for `service`, applying the staging scale."""
+    try:
+        base = SERVICE_DEMAND_PARAMS[service.name]
+    except KeyError as exc:
+        raise KeyError(
+            f"no demand parameters for service {service.name!r} — add an entry to "
+            "SERVICE_DEMAND_PARAMS when the topology gains a service"
+        ) from exc
+    if service.project == "prod":
+        return base
+    return replace(base, base_rate=base.base_rate * STAGING_SCALE)
+
+    
+def _daily_shape(hour_of_day: np.ndarray, diurnal_strength: float) -> np.ndarray:
+    """The daily multiplier for raw hour-of-day values, averaging exactly 1.0.
+
+    Normalization is computed against all 24 integer hours rather than against
+    the values passed in, so a partial-day slice gets the same multipliers the
+    full series would — convention (1) in the module docstring.
+    """
+    def raw(h: np.ndarray) -> np.ndarray:
+        theta = 2.0 * np.pi * (h - WORKDAY_CENTRE_HOUR_UTC) / 24.0
+        theta_skewed = 2.0 * np.pi * (h - WORKDAY_CENTRE_HOUR_UTC - _HARMONIC_SKEW_HOURS) / 24.0
+        return (
+            1.0
+            + diurnal_strength * _DAILY_AMP_FUNDAMENTAL * np.cos(theta)
+            + diurnal_strength * _DAILY_AMP_HARMONIC * np.cos(2.0 * theta_skewed)
+        )
+
+    return raw(np.asarray(hour_of_day, dtype=float)) / raw(np.arange(24.0)).mean()
 
 def generate_demand(
     service: Service,
