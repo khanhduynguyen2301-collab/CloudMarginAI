@@ -12,17 +12,32 @@ Implements docs/phase1/workload-cost-model.md, "Demand generation":
 
 No holiday calendar in v1 (documented limitation, not an oversight).
 growth_rate: 0.5%-1.5% per week, service-dependent.
+
+Three conventions this module fixes, because everything downstream inherits
+them:
+
+1. `base_rate` means "expected requests in an average WEEKDAY hour, on day 0".
+   `_daily_curve` is normalized so its 24 values average exactly 1.0, and
+   `_weekly_factor` is exactly 1.0 on weekdays. Without that normalization,
+   base_rate silently stops meaning anything and every derived dollar figure in
+   cost_model/billing.py is off by a constant nobody remembers.
+2. Timestamps are UTC and UTC *is* the reference locale for org_demo — there is
+   no region column on application_activity_hourly to key a per-region offset
+   off, so "peak ~09:00-17:00 local" is implemented as peak 09:00-17:00 UTC.
+   Phase 2 derives hour-of-day features from this same column and will see the
+   busy window where WORKDAY_CENTRE_HOUR_UTC puts it.
+3. The lognormal noise is divided by exp(sigma^2 / 2) so it has mean exactly
+   1.0. rng.lognormal(mean=0, sigma=s) has expectation exp(s^2/2), which would
+   otherwise add a small systematic upward drift on top of growth_rate.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
 from simulator.topology import Service
-
 
 # Phase centre of the daily curve's fundamental, UTC. NOT the argmax: the
 # harmonic skew below pulls the actual maximum earlier, to ~11:00, leaving a
@@ -38,25 +53,25 @@ _DAILY_AMP_FUNDAMENTAL = 0.45
 _DAILY_AMP_HARMONIC = -0.15
 _HARMONIC_SKEW_HOURS = 1.5
 
+
 @dataclass(frozen=True)
 class DemandParams:
-    """Per-service constants for demand generation.
+    """Per-service demand constants.
 
-    These are the knobs you turn to make a service's demand look realistic
-    and consistent with the SKUs/topology it will later bill against in
-    cost_model/billing.py. The values here are just examples; you can change
-    them to whatever you like, as long as they are plausible.
+    These live here rather than on `topology.Service` deliberately: topology.py
+    is a transcription of a frozen doc decision, and hanging tunables off it
+    would quietly turn it into a config file. Calibrating these numbers is a
+    workload-model concern, so it belongs to the workload model.
     """
 
-    base_rate: float  # requests per hour at hour 0 (UTC) of day 0
-    growth_rate: float  # week-over-week growth rate (0.005-0.015)
-    weekend_factor: float  # weekend demand relative to weekday (0.55-0.95)
-    avg_requests_per_customer: float  # used to derive active_customers
-    conversion_rate: float  # used to derive transactions
-    diurnal_strength: float = 1.0  # scales the daily curve's swing about 1.0;
-    # 1.0 is the full user-facing shape, 0.0 is flat. Queue-driven and batch
-    # services sit low: a backlog drains overnight instead of going idle.
-    sigma_demand: float = 0.03  # lognormal noise sigma on hourly requests
+    base_rate: float  # expected requests in an average weekday hour, day 0
+    weekend_factor: float  # Sat/Sun multiplier; doc range 0.55-0.7 for user-facing
+    growth_rate: float  # per week, doc range 0.005-0.015
+    diurnal_strength: float  # 0.0 = flat, 1.0 = full user-facing swing
+    avg_requests_per_customer: float
+    conversion_rate: float
+    sigma_demand: float = 0.08
+    sigma_customers: float = 0.04
 
 
 # Calibration note for cost_model/billing.py — do not tune ingestion-worker's
@@ -152,7 +167,7 @@ def params_for(service: Service) -> DemandParams:
         return base
     return replace(base, base_rate=base.base_rate * STAGING_SCALE)
 
-    
+
 def _daily_shape(hour_of_day: np.ndarray, diurnal_strength: float) -> np.ndarray:
     """The daily multiplier for raw hour-of-day values, averaging exactly 1.0.
 
@@ -160,6 +175,7 @@ def _daily_shape(hour_of_day: np.ndarray, diurnal_strength: float) -> np.ndarray
     the values passed in, so a partial-day slice gets the same multipliers the
     full series would — convention (1) in the module docstring.
     """
+
     def raw(h: np.ndarray) -> np.ndarray:
         theta = 2.0 * np.pi * (h - WORKDAY_CENTRE_HOUR_UTC) / 24.0
         theta_skewed = 2.0 * np.pi * (h - WORKDAY_CENTRE_HOUR_UTC - _HARMONIC_SKEW_HOURS) / 24.0
@@ -182,13 +198,13 @@ def _daily_curve(hours: pd.DatetimeIndex, diurnal_strength: float) -> np.ndarray
     return _daily_shape(np.asarray(hours.hour, dtype=float), diurnal_strength)
 
 
-def _weekly_factor(hours: pd.DatetimeIndex, weekend_factor: float) -> np.ndarray:
+def _weekly_factor(hours: pd.DatetimeIndex, params: DemandParams) -> np.ndarray:
     """Day-of-week multiplier: exactly 1.0 Mon-Fri, `weekend_factor` Sat/Sun.
 
     Weekdays are pinned at 1.0 rather than renormalized across the whole week,
     so `base_rate` reads as "average weekday hour" — convention (1).
     """
-    dow = np.asarray(hours.dayofweek) # Monday=0 ... Sunday=6
+    dow = np.asarray(hours.dayofweek)  # Monday=0 ... Sunday=6
     return np.where(dow >= 5, params.weekend_factor, 1.0)
 
 
@@ -235,4 +251,36 @@ def generate_demand(
         are NOT computed here — the caller fills revenue=None and a
         static plan value, per Phase 0's deferred finance outcome.
     """
-    raise NotImplementedError("TODO: implement the demand formula above")
+    params = params_for(service)
+    n = len(hours)
+
+    expected = (
+        params.base_rate
+        * _daily_curve(hours, params.diurnal_strength)
+        * _weekly_factor(hours, params)
+        * _growth(hours, params)
+    )
+    requests = expected * _unit_mean_lognormal(rng, params.sigma_demand, n)
+
+    # Floor of 1: an overnight trough x weekend factor x a low noise draw can
+    # round to zero for a small service, and Phase 2 divides by requests to get
+    # cost-per-request. A zero there is a blown-up feature, not a data point.
+    requests_int = np.maximum(np.rint(requests).astype(np.int64), 1)
+
+    customers = (requests / params.avg_requests_per_customer) * _unit_mean_lognormal(
+        rng, params.sigma_customers, n
+    )
+    customers_int = np.clip(np.rint(customers).astype(np.int64), 1, requests_int)
+
+    transactions_int = np.clip(
+        np.rint(requests * params.conversion_rate).astype(np.int64), 0, requests_int
+    )
+
+    return pd.DataFrame(
+        {
+            "requests": requests_int,
+            "active_customers": customers_int,
+            "transactions": transactions_int,
+        },
+        index=pd.Index(hours, name="hour"),
+    )
