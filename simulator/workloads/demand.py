@@ -208,7 +208,7 @@ def _weekly_factor(hours: pd.DatetimeIndex, params: DemandParams) -> np.ndarray:
     return np.where(dow >= 5, params.weekend_factor, 1.0)
 
 
-def _growth(hours: pd.DatetimeIndex, params: DemandParams) -> np.ndarray:
+def _growth(hours: pd.DatetimeIndex, params: DemandParams, run_start: pd.Timestamp) -> np.ndarray:
     """Week-over-week compounding trend, in fractional days from the run start.
 
     Fractional rather than whole days so the trend is smooth instead of stepping
@@ -217,7 +217,7 @@ def _growth(hours: pd.DatetimeIndex, params: DemandParams) -> np.ndarray:
     """
     if len(hours) == 0:
         return np.zeros(0)
-    elapsed_days = np.asarray((hours - hours[0]) / pd.Timedelta(days=1), dtype=float)
+    elapsed_days = np.asarray((hours - run_start) / pd.Timedelta(days=1), dtype=float)
     return (1.0 + params.growth_rate) ** (elapsed_days / 7.0)
 
 
@@ -232,6 +232,7 @@ def generate_demand(
     service: Service,
     hours: pd.DatetimeIndex,
     rng: np.random.Generator,
+    run_start: pd.Timestamp,
 ) -> pd.DataFrame:
     """Generate clean hourly demand for one service over `hours`.
 
@@ -258,7 +259,7 @@ def generate_demand(
         params.base_rate
         * _daily_curve(hours, params.diurnal_strength)
         * _weekly_factor(hours, params)
-        * _growth(hours, params)
+        * _growth(hours, params, run_start)
     )
     requests = expected * _unit_mean_lognormal(rng, params.sigma_demand, n)
 
