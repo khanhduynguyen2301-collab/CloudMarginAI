@@ -171,6 +171,47 @@ def _daily_shape(hour_of_day: np.ndarray, diurnal_strength: float) -> np.ndarray
 
     return raw(np.asarray(hour_of_day, dtype=float)) / raw(np.arange(24.0)).mean()
 
+
+def _daily_curve(hours: pd.DatetimeIndex, diurnal_strength: float) -> np.ndarray:
+    """Hour-of-day multiplier for each timestamp in `hours`.
+
+    `diurnal_strength` scales the swing: 1.0 is a full user-facing workday
+    profile, 0.0 is flat. Normalization happens after scaling, so the mean-1.0
+    guarantee holds at every strength.
+    """
+    return _daily_shape(np.asarray(hours.hour, dtype=float), diurnal_strength)
+
+
+def _weekly_factor(hours: pd.DatetimeIndex, weekend_factor: float) -> np.ndarray:
+    """Day-of-week multiplier: exactly 1.0 Mon-Fri, `weekend_factor` Sat/Sun.
+
+    Weekdays are pinned at 1.0 rather than renormalized across the whole week,
+    so `base_rate` reads as "average weekday hour" — convention (1).
+    """
+    dow = np.asarray(hours.dayofweek) # Monday=0 ... Sunday=6
+    return np.where(dow >= 5, params.weekend_factor, 1.0)
+
+
+def _growth(hours: pd.DatetimeIndex, params: DemandParams) -> np.ndarray:
+    """Week-over-week compounding trend, in fractional days from the run start.
+
+    Fractional rather than whole days so the trend is smooth instead of stepping
+    at midnight — a midnight step is exactly the kind of artefact a change-point
+    detector in Phase 2 would happily latch onto.
+    """
+    if len(hours) == 0:
+        return np.zeros(0)
+    elapsed_days = np.asarray((hours - hours[0]) / pd.Timedelta(days=1), dtype=float)
+    return (1.0 + params.growth_rate) ** (elapsed_days / 7.0)
+
+
+def _unit_mean_lognormal(rng: np.random.Generator, sigma: float, size: int) -> np.ndarray:
+    """Multiplicative lognormal noise with mean exactly 1.0 — convention (3)."""
+    if sigma <= 0.0:
+        return np.ones(size)
+    return rng.lognormal(mean=0.0, sigma=sigma, size=size) / np.exp(sigma**2 / 2.0)
+
+
 def generate_demand(
     service: Service,
     hours: pd.DatetimeIndex,
