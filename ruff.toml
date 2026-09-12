@@ -1,0 +1,7 @@
+# The demand-model docstrings carry an ASCII formula block that is more
+# readable unwrapped than folded at 88 columns, so the limit is 100 rather
+# than ruff's default.
+line-length = 100
+
+[lint]
+select = ["E", "F", "W", "I"]

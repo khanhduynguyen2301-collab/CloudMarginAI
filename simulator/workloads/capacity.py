@@ -8,7 +8,8 @@ generation":
                          , bounded by [min_replicas(service), max_replicas(service)]
     cpu_utilization(h) = requests(h) / (instance_count(h) * capacity_per_instance(service)) + noise
     latency_p50/p99(h) = base_latency(service) * congestion_factor(cpu_utilization) + noise
-    error_count(h)     = requests(h) * base_error_rate(service) (Poisson), rising only under injected incidents
+    error_count(h)     = requests(h) * base_error_rate(service) (Poisson),
+                         rising only under injected incidents
 
 `ml-training-job` (ResourceKind.BATCH_ACCELERATOR) is the one service
 whose instance_count and GPU utilization are NOT demand-driven — it runs

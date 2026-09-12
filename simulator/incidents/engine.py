@@ -53,7 +53,13 @@ def inject(
     organization_id: str,
     chronological_split: str,
     simulator_seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, DeploymentRow | ResourceChangeRow, GroundTruthIncidentRow]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    DeploymentRow | ResourceChangeRow,
+    GroundTruthIncidentRow,
+]:
     """Mutate `demand`/`metrics`/`billing` in place for [start_ts, start_ts + duration_hours)
     per this incident_type's spec (simulator.incidents.types.INCIDENT_SPECS),
     write the causal event using CAUSAL_EVENT_TAG, and build the
