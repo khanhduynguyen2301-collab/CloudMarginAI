@@ -13,7 +13,7 @@ Implements docs/phase1/workload-cost-model.md, "Demand generation":
 No holiday calendar in v1 (documented limitation, not an oversight).
 growth_rate: 0.5%-1.5% per week, service-dependent.
 
-Three conventions this module fixes, because everything downstream inherits
+Four conventions this module fixes, because everything downstream inherits
 them:
 
 1. `base_rate` means "expected requests in an average WEEKDAY hour, on day 0".
@@ -29,6 +29,12 @@ them:
 3. The lognormal noise is divided by exp(sigma^2 / 2) so it has mean exactly
    1.0. rng.lognormal(mean=0, sigma=s) has expectation exp(s^2/2), which would
    otherwise add a small systematic upward drift on top of growth_rate.
+4. `run_start` is passed explicitly rather than taken from `hours[0]`, so the
+   growth trend is identical whether you generate the full 90 days or a single
+   window. The noise stream is *not* slice-invariant — a shorter `hours` draws
+   fewer values — so the rule remains: generate the full run, then slice.
+   `run_start` makes the deterministic half correct by construction; this
+   convention covers the rest.
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 
+from simulator.noise import unit_mean_lognormal
 from simulator.topology import Service
 
 # Phase centre of the daily curve's fundamental, UTC. NOT the argmax: the
@@ -214,6 +221,10 @@ def _growth(hours: pd.DatetimeIndex, params: DemandParams, run_start: pd.Timesta
     Fractional rather than whole days so the trend is smooth instead of stepping
     at midnight — a midnight step is exactly the kind of artefact a change-point
     detector in Phase 2 would happily latch onto.
+
+    Anchored on the explicit `run_start`, never on `hours[0]`: a call given only
+    part of the run (the held-out test window, say) must continue the trend, not
+    restart it at 1.0. See convention (4).
     """
     if len(hours) == 0:
         return np.zeros(0)
@@ -222,10 +233,13 @@ def _growth(hours: pd.DatetimeIndex, params: DemandParams, run_start: pd.Timesta
 
 
 def _unit_mean_lognormal(rng: np.random.Generator, sigma: float, size: int) -> np.ndarray:
-    """Multiplicative lognormal noise with mean exactly 1.0 — convention (3)."""
-    if sigma <= 0.0:
-        return np.ones(size)
-    return rng.lognormal(mean=0.0, sigma=sigma, size=size) / np.exp(sigma**2 / 2.0)
+    """Multiplicative lognormal noise with mean exactly 1.0 — convention (3).
+
+    Thin delegation to simulator.noise, which is where the shared helper lives
+    now that billing.py, changes/ and incidents/ all need it. Kept under this
+    name so existing call sites and tests are unaffected.
+    """
+    return unit_mean_lognormal(rng, sigma, size)
 
 
 def generate_demand(
@@ -242,9 +256,14 @@ def generate_demand(
             you choose — pick values consistent with the SKUs/topology
             this service will later bill against in cost_model/billing.py).
         hours: the full run's hourly timestamp index (UTC).
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "workload")`, never
-            instantiate a Generator directly.
+        rng: this service's own Generator — get it via
+            `rng_for(master_seed, f"workload:{service.project}:{service.name}")`.
+            Per-service rather than one shared "workload" stream, so adding or
+            reordering services does not shift every other service's history.
+            Never instantiate a Generator directly.
+        run_start: first timestamp of the WHOLE run, even when `hours` is a
+            subset of it. Sourced from the CLI's --start-date, the same value
+            manifest.json records. See convention (4).
 
     Returns:
         DataFrame indexed by `hour` with columns: requests (int),

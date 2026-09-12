@@ -13,8 +13,6 @@ Split deliberately into two halves:
 from __future__ import annotations
 
 import numpy as np
-from numpy.random import seed
-from numpy.random import seed
 import pandas as pd
 import pytest
 
@@ -34,13 +32,16 @@ from simulator.workloads.demand import (
 RUN_START = pd.Timestamp("2026-01-01", tz="UTC")
 RUN_DAYS = 90
 
+
 @pytest.fixture(scope="module")
 def hours() -> pd.DatetimeIndex:
     return pd.date_range(RUN_START, periods=24 * RUN_DAYS, freq="h", tz="UTC")
 
+
 @pytest.fixture(scope="module")
 def org():
     return build_topology()
+
 
 def _demand(service, hours, seed: int = 42):
     """Generate with this service's own stream, the way cli.py should."""
@@ -58,21 +59,25 @@ def test_daily_shape_averages_exactly_one(strength):
     """Convention (1): base_rate is only meaningful if this averages 1.0."""
     assert _daily_shape(np.arange(24.0), strength).mean() == pytest.approx(1.0, rel=1e-12)
 
-def test_daily_shape_is_slide_invariant():
-    """A partial-day slide must get the same multipliers the full day would."""
+
+def test_daily_shape_is_slice_invariant():
+    """A partial-day slice must get the same multipliers the full day would."""
     full = _daily_shape(np.arange(24.0), 1.0)
     window = _daily_shape(np.array([9.0, 10.0, 11.0]), 1.0)
     assert np.allclose(window, full[9:12], rtol=1e-12, atol=0.0)
+
 
 def test_daily_shape_is_flat_at_zero_strength():
     """Strength=0 means no daily variation."""
     assert np.allclose(_daily_shape(np.arange(24.0), 0.0), 1.0, rtol=1e-12, atol=0.0)
 
+
 def test_daily_shape_peaks_in_the_workday():
-    """Spec asks for a busy window over the working day, trough  overnight."""
+    """Spec asks for a busy window over the working day, trough overnight."""
     curve = _daily_shape(np.arange(24.0), 1.0)
     assert 9 <= int(curve.argmax()) <= 17
-    assert int(curve.argmin()) in range(0,6)
+    assert int(curve.argmin()) in range(0, 6)
+
 
 def test_weekly_factor_is_exactly_one_on_weekdays(hours):
     params = SERVICE_DEMAND_PARAMS["web-frontend"]
@@ -98,10 +103,10 @@ def test_growth_is_anchored_to_run_start_not_the_slice(hours):
     """The days 76-90 regression: regenerating one window must not restart
     the trend at 1.0. This is the bug that made a standalone test-split
     generation come out ~12% low."""
-    tail = hours[24 * 75:]
+    tail = hours[24 * 75 :]
     params = SERVICE_DEMAND_PARAMS["checkout-api"]
     assert np.allclose(
-        _growth(hours, params, hours[0])[24 * 75:],
+        _growth(hours, params, hours[0])[24 * 75 :],
         _growth(tail, params, hours[0]),
     )
 

@@ -125,7 +125,8 @@ class GroundTruthIncidentRow:
 
     ground_truth_id: str
     organization_id: str
-    incident_type: str  # "logging_regression" | "query_regression" | "idle_accelerator" | "autoscaling_error"
+    # "logging_regression" | "query_regression" | "idle_accelerator" | "autoscaling_error"
+    incident_type: str
     affected_service_or_resource: str
     injected_at: datetime
     duration_hours: int

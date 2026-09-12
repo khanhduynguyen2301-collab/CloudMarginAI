@@ -26,7 +26,9 @@ CREDIT_RATE = 0.03
 SKU_PRICES: dict[str, SkuPrice] = {
     "compute.vcpu-hour": SkuPrice("compute.vcpu-hour", "vCPU-hour", 0.031),
     "compute.gpu-hour": SkuPrice("compute.gpu-hour", "GPU-hour", 2.10),
-    "storage.standard-gb-month": SkuPrice("storage.standard-gb-month", "GB-month (hourly fraction)", 0.020 / 730),
+    "storage.standard-gb-month": SkuPrice(
+        "storage.standard-gb-month", "GB-month (hourly fraction)", 0.020 / 730
+    ),
     "network.egress-gb": SkuPrice("network.egress-gb", "GB", 0.085),
     "logging.ingested-gb": SkuPrice("logging.ingested-gb", "GB", 0.50),
     "db.cpu-hour": SkuPrice("db.cpu-hour", "vCPU-hour", 0.096),
