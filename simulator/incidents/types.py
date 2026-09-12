@@ -59,7 +59,8 @@ INCIDENT_SPECS: dict[IncidentType, IncidentSpec] = {
     IncidentType.QUERY_REGRESSION: IncidentSpec(
         incident_type=IncidentType.QUERY_REGRESSION,
         service_name=INCIDENT_SERVICE_MAP["query_regression"],
-        magnitude_low=1.8,  # queries/request multiplier; latency 1.5-2.5x is a second, correlated draw
+        # queries/request multiplier; latency 1.5-2.5x is a second, correlated draw
+        magnitude_low=1.8,
         magnitude_high=3.0,
         duration_hours_low=48,
         duration_hours_high=120,

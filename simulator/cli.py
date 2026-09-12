@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -23,7 +22,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, required=True, help="master seed for the whole run")
     parser.add_argument("--start-date", type=str, default="2026-01-01", help="YYYY-MM-DD, UTC")
     parser.add_argument("--days", type=int, default=90)
-    parser.add_argument("--config", type=str, default=None, help="optional path to override defaults")
+    parser.add_argument(
+        "--config", type=str, default=None, help="optional path to override defaults"
+    )
     parser.add_argument("--out", type=str, default="./output", help="output directory for this run")
     return parser
 
@@ -49,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
          any gate fails
     """
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    _args = parser.parse_args(argv)  # named _args until the orchestration below uses it
     raise NotImplementedError("TODO: wire the pipeline above together")
 
 
