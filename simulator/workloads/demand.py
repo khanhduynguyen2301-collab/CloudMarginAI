@@ -43,6 +43,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 
+from simulator.noise import unit_mean_lognormal
 from simulator.topology import Service
 
 # Phase centre of the daily curve's fundamental, UTC. NOT the argmax: the
@@ -232,10 +233,13 @@ def _growth(hours: pd.DatetimeIndex, params: DemandParams, run_start: pd.Timesta
 
 
 def _unit_mean_lognormal(rng: np.random.Generator, sigma: float, size: int) -> np.ndarray:
-    """Multiplicative lognormal noise with mean exactly 1.0 — convention (3)."""
-    if sigma <= 0.0:
-        return np.ones(size)
-    return rng.lognormal(mean=0.0, sigma=sigma, size=size) / np.exp(sigma**2 / 2.0)
+    """Multiplicative lognormal noise with mean exactly 1.0 — convention (3).
+
+    Thin delegation to simulator.noise, which is where the shared helper lives
+    now that billing.py, changes/ and incidents/ all need it. Kept under this
+    name so existing call sites and tests are unaffected.
+    """
+    return unit_mean_lognormal(rng, sigma, size)
 
 
 def generate_demand(
