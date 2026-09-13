@@ -68,6 +68,76 @@ class BillingParams:
     sigma_usage: float = 0.04  # applied to usage — convention 9
 
 
+# Calibration (see docs/phase1/decisions.md):
+#
+# ingestion-worker  log_kb_per_request=50 -> ~60 GB/day of ingestion. A 3.5x
+#                   logging regression (the weakest specified) adds ~$72/day at
+#                   $0.50/GB, clearing the $50/day materiality bar with margin.
+#                   35 KB clears it by only 4%; do not lower this.
+# checkout-api      db_cpu_ms_per_request=3500 -> ~$84/day of db.cpu-hour. A
+#                   1.8x query regression (the weakest specified) adds ~$67/day.
+# ml-training-job   8 GPUs x 4h/day x $2.10 = ~$65/day baseline. An idle
+#                   accelerator holds them on around the clock: +20h x 8 x $2.10
+#                   = ~$325/day. Clears trivially.
+# recommendation-api vcpu_per_instance=8: the autoscaling incident only adds
+#                   instances during hours where demand would have run fewer
+#                   than the raised floor, so its dollar impact is modest —
+#                   ~$25/day at 3x, ~$111/day at 5x. At 3x it clears the
+#                   materiality bar ONLY under the service-level reading of the
+#                   5% rule. See the OPEN entry in decisions.md.
+SERVICE_BILLING_PARAMS: dict[str, BillingParams] = {
+    "web-frontend": BillingParams(
+        vcpu_per_instance=2.0,
+        egress_kb_per_request=45.0,  # serves HTML/JS/assets
+        log_kb_per_request=2.0,
+        storage_base_gb=40.0,
+    ),
+    "checkout-api": BillingParams(
+        vcpu_per_instance=2.0,
+        egress_kb_per_request=8.0,
+        log_kb_per_request=3.0,
+        db_cpu_ms_per_request=3500.0,  # the query-regression lever
+        storage_base_gb=200.0,  # order history
+        storage_growth_per_week=0.015,
+    ),
+    "recommendation-api": BillingParams(
+        vcpu_per_instance=8.0,  # inference-heavy; see calibration note
+        egress_kb_per_request=6.0,
+        log_kb_per_request=2.5,
+        storage_base_gb=120.0,
+    ),
+    "ingestion-worker": BillingParams(
+        vcpu_per_instance=2.0,
+        egress_kb_per_request=1.0,
+        log_kb_per_request=50.0,  # the logging-regression lever — see note
+        storage_base_gb=600.0,  # ingested data accumulates
+        storage_growth_per_week=0.02,
+    ),
+    "billing-worker": BillingParams(
+        vcpu_per_instance=1.0,
+        egress_kb_per_request=2.0,
+        log_kb_per_request=4.0,
+        storage_base_gb=80.0,
+    ),
+    "ml-training-job": BillingParams(
+        vcpu_per_instance=0.0,  # billed as GPU-hours, not vCPU-hours
+        egress_kb_per_request=0.0,
+        log_kb_per_request=0.0,  # no per-request traffic to log
+        storage_base_gb=800.0,  # training corpus + checkpoints
+        storage_growth_per_week=0.005,
+    ),
+}
+
+# Fixed columns for every row this simulator emits.
+_FIXED = {
+    "organization_id": ORGANIZATION_ID,
+    "currency": CURRENCY,
+    "is_reconciled": False,
+    "source": SOURCE,
+    "schema_version": SCHEMA_VERSION,
+}
+
+
 def usage_to_billing_rows(
     service: Service,
     demand: pd.DataFrame,
