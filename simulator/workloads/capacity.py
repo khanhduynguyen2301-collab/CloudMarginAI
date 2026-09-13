@@ -88,11 +88,14 @@ class CapacityParams:
     p99_multiplier: float          # p99 = p50 * this, before congestion
     base_error_rate: float         # errors per request; Poisson mean
     memory_baseline: float         # 0-1; memory is far less demand-elastic than CPU
+    memory_elasticity: float = 0.25  # how much of a CPU swing memory follows
     region_weights: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_REGION_WEIGHTS)
     )
     sigma_cpu: float = 0.03
     sigma_latency: float = 0.05
+    sigma_memory: float = 0.02
+    
     # --- BATCH_ACCELERATOR only ---
     gpu_count: int = 0
     job_window_utc: tuple[int, int] = (2, 6)   # [start, end) hour, UTC
