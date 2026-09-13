@@ -3,25 +3,289 @@
 Implements docs/phase1/workload-cost-model.md, "Capacity & reliability
 generation":
 
-    target_utilization(service) = 0.55-0.70          # policy setpoint, varies by service
-    instance_count(h) = ceil(requests(h) / (capacity_per_instance(service) * target_utilization))
-                         , bounded by [min_replicas(service), max_replicas(service)]
-    cpu_utilization(h) = requests(h) / (instance_count(h) * capacity_per_instance(service)) + noise
-    latency_p50/p99(h) = base_latency(service) * congestion_factor(cpu_utilization) + noise
-    error_count(h)     = requests(h) * base_error_rate(service) (Poisson),
+    target_utilization(service) = 0.55-0.70
+    instance_count(h) = ceil(requests(h) / (capacity_per_instance x target_utilization))
+                         , bounded by [min_replicas, max_replicas]
+    cpu_utilization(h) = requests(h) / (instance_count(h) x capacity_per_instance) + noise
+    latency_p50/p99(h) = base_latency x congestion_factor(cpu_utilization) + noise
+    error_count(h)     = requests(h) x base_error_rate (Poisson),
                          rising only under injected incidents
 
-`ml-training-job` (ResourceKind.BATCH_ACCELERATOR) is the one service
-whose instance_count and GPU utilization are NOT demand-driven — it runs
-on a fixed job schedule. Branch on `service.resource_kind` rather than
-hardcoding the service name.
+Four conventions this module fixes, on top of the four in demand.py:
+
+5. Region fan-out is decided HERE, not in demand.py. `application_activity_hourly`
+   has no region column, so demand is service-level; `resource_metrics_hourly` is
+   grained at resource-hour and carries region. Each service's hourly requests are
+   split across its regions by fixed weights summing to 1.0, with exactly one
+   resource per service-region in v1. A variable resource pool (where
+   instance_count is the pool size and resource_ids churn over time) is more
+   realistic but none of the four confirmed incident types need it.
+6. `resource_id` is derived from the topology, never the rng, so Phase 3 can name
+   a resource as an incident's cause and have that string be reproducible. It
+   includes `project`: prod and staging both contain web-frontend and
+   checkout-api, so a name without it collides across projects.
+7. Regions are iterated in sorted order, not dict order, so reordering
+   DEFAULT_REGION_WEIGHTS cannot shift the random stream. Same spirit as the
+   per-service rng decision in decisions.md.
+8. BATCH_ACCELERATOR services do not fan out across regions and do not follow
+   demand at all — a training job runs on a fixed schedule in one region. Their
+   duty cycle is what makes an idle accelerator (GPU billed, utilization near
+   zero) detectable in Phase 3 rather than indistinguishable from noise.
+
+Returns a LONG frame — one row per (resource_id, hour) — unlike demand.py, which
+returns one row per hour.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
 
-from simulator.topology import Service
+from simulator.noise import unit_mean_lognormal
+from simulator.topology import ResourceKind, Service
+
+# Traffic distribution across the three regions in topology.py. Primary region
+# first by convention, though iteration is sorted (convention 7).
+DEFAULT_REGION_WEIGHTS: dict[str, float] = {
+    "us-central1": 0.50,
+    "us-east1": 0.30,
+    "europe-west1": 0.20,
+}
+
+# A single-region weighting, for services that do not fan out (convention 8).
+SINGLE_REGION_WEIGHTS: dict[str, float] = {"us-central1": 1.0}
+
+# staging carries STAGING_SCALE (0.04) of prod's demand, so prod's replica floor
+# would pin it at min_replicas for the entire run — constant instance_count,
+# perfectly flat compute cost, and an undetectable autoscaling incident. Replica
+# bounds are scaled too, floored so staging still has somewhere to scale.
+STAGING_REPLICA_SCALE = 0.10
+STAGING_MIN_REPLICAS_FLOOR = 1
+STAGING_MAX_REPLICAS_FLOOR = 2
+
+# staging also runs in ONE region rather than fanning out. Two reasons. It is
+# realistic — a staging environment mirrors prod's shape, not its geography. And
+# it is necessary: splitting 4% of prod's demand three ways leaves the
+# lowest-weight region below one instance's worth of traffic for the whole run,
+# which pins instance_count at 1 no matter how the replica bounds are scaled.
+# Concentrating the traffic gives staging a band it can actually move within.
+
+
+@dataclass(frozen=True)
+class CapacityParams:
+    """Per-service capacity constants.
+
+    Fields below the divider apply only to ResourceKind.BATCH_ACCELERATOR and
+    are ignored for demand-driven services.
+    """
+
+    capacity_per_instance: float   # requests/hour one instance absorbs at 100% CPU
+    target_utilization: float      # autoscaler setpoint; doc range 0.55-0.70
+    min_replicas: int              # the autoscaling incident multiplies THIS 3-5x
+    max_replicas: int
+    base_latency_p50_ms: float
+    p99_multiplier: float          # p99 = p50 * this, before congestion
+    base_error_rate: float         # errors per request; Poisson mean
+    memory_baseline: float         # 0-1; memory is far less demand-elastic than CPU
+    memory_elasticity: float = 0.25  # how much of a CPU swing memory follows
+    region_weights: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_REGION_WEIGHTS)
+    )
+    sigma_cpu: float = 0.03
+    sigma_latency: float = 0.05
+    sigma_memory: float = 0.02
+    
+    # --- BATCH_ACCELERATOR only ---
+    gpu_count: int = 0
+    job_window_utc: tuple[int, int] = (2, 6)   # [start, end) hour, UTC
+    gpu_utilization_active: float = 0.85
+
+
+# Calibrated so every demand-driven service's instance_count actually varies
+# across the run. tests/test_capacity.py enforces this: a service pinned at
+# min_replicas has perfectly flat compute cost, and the autoscaling-error
+# incident becomes invisible on it.
+SERVICE_CAPACITY_PARAMS: dict[str, CapacityParams] = {
+    "web-frontend": CapacityParams(
+        capacity_per_instance=3_000,
+        target_utilization=0.60,
+        min_replicas=4,
+        max_replicas=90,
+        base_latency_p50_ms=45.0,
+        p99_multiplier=3.2,
+        base_error_rate=0.0012,
+        memory_baseline=0.45,
+    ),
+    "checkout-api": CapacityParams(
+        capacity_per_instance=1_500,
+        target_utilization=0.58,
+        min_replicas=3,
+        max_replicas=60,
+        base_latency_p50_ms=120.0,
+        p99_multiplier=4.0,
+        base_error_rate=0.0025,
+        memory_baseline=0.55,
+    ),
+    "recommendation-api": CapacityParams(
+        capacity_per_instance=2_200,
+        target_utilization=0.62,
+        min_replicas=4,
+        max_replicas=70,
+        base_latency_p50_ms=80.0,
+        p99_multiplier=3.5,
+        base_error_rate=0.0018,
+        memory_baseline=0.60,
+    ),
+    # Queue-driven workers: higher per-instance throughput, flatter demand, so
+    # narrower replica bands.
+    "ingestion-worker": CapacityParams(
+        capacity_per_instance=2_500,
+        target_utilization=0.68,
+        min_replicas=3,
+        max_replicas=40,
+        base_latency_p50_ms=25.0,
+        p99_multiplier=2.4,
+        base_error_rate=0.0008,
+        memory_baseline=0.50,
+    ),
+    "billing-worker": CapacityParams(
+        capacity_per_instance=1_200,
+        target_utilization=0.65,
+        min_replicas=2,
+        max_replicas=14,
+        base_latency_p50_ms=200.0,
+        p99_multiplier=2.8,
+        base_error_rate=0.0010,
+        memory_baseline=0.40,
+    ),
+    # Batch accelerator: schedule-driven, single region, GPU duty cycle. The
+    # demand-driven fields below are unused but must be present.
+    "ml-training-job": CapacityParams(
+        capacity_per_instance=1_000,
+        target_utilization=0.60,
+        min_replicas=0,
+        max_replicas=0,
+        base_latency_p50_ms=0.0,
+        p99_multiplier=1.0,
+        base_error_rate=0.0005,
+        memory_baseline=0.70,
+        region_weights=dict(SINGLE_REGION_WEIGHTS),
+        gpu_count=8,
+        job_window_utc=(2, 6),
+        gpu_utilization_active=0.85,
+    ),
+}
+
+_WEIGHT_TOLERANCE = 1e-9
+
+
+def params_for(service: Service) -> CapacityParams:
+    """Resolve capacity constants for `service`, scaling replica bounds on staging.
+
+    Raises:
+        KeyError: if the topology gained a service with no entry here.
+        ValueError: if its region weights do not sum to 1.0 — a silent
+            mis-weighting would make per-resource request counts stop summing
+            back to the service's demand, and nothing else would notice.
+    """
+    try:
+        base = SERVICE_CAPACITY_PARAMS[service.name]
+    except KeyError as exc:
+        raise KeyError(
+            f"no capacity parameters for service {service.name!r} — add an entry to "
+            "SERVICE_CAPACITY_PARAMS when the topology gains a service"
+        ) from exc
+
+    total = sum(base.region_weights.values())
+    if abs(total - 1.0) > _WEIGHT_TOLERANCE:
+        raise ValueError(
+            f"region weights for {service.name!r} sum to {total!r}, expected 1.0"
+        )
+
+    if service.project == "prod":
+        return base
+    return replace(
+        base,
+        min_replicas=max(
+            STAGING_MIN_REPLICAS_FLOOR,
+            round(base.min_replicas * STAGING_REPLICA_SCALE),
+        ),
+        max_replicas=max(
+            STAGING_MAX_REPLICAS_FLOOR,
+            round(base.max_replicas * STAGING_REPLICA_SCALE),
+        ),
+        region_weights=dict(SINGLE_REGION_WEIGHTS),
+    )
+
+
+def resource_id_for(service: Service, region: str, ordinal: int = 1) -> str:
+    """Deterministic resource identity — derived from topology, never the rng.
+
+    Includes `project` because prod and staging both contain web-frontend and
+    checkout-api; without it the IDs collide and validate.py's uniqueness gate
+    would fail on rows that are genuinely distinct.
+    """
+    return f"{service.project}-{service.name}-{region}-{ordinal:03d}"
+
+
+def _congestion(cpu: np.ndarray, target_utilization: float) -> np.ndarray:
+    """Latency multiplier from CPU pressure, normalized to 1.0 at the setpoint.
+
+    Climbs as CPU approaches saturation; the floor on the denominator stops it
+    diverging as cpu -> 1.
+    """
+    return (1.0 - target_utilization) / np.maximum(1.0 - cpu, 0.05)
+
+
+def _batch_frame(
+    service: Service,
+    params: CapacityParams,
+    hours: pd.DatetimeIndex,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Schedule-driven metrics for a BATCH_ACCELERATOR service (convention 8).
+
+    instance_count and GPU utilization follow a fixed daily job window rather
+    than demand. Outside the window the GPUs are off: instance_count 0 and
+    gpu_utilization 0.0 — zero rather than NaN, because the resource exists and
+    is idle. NaN is reserved for services with no GPU at all.
+    """
+    n = len(hours)
+    start, end = params.job_window_utc
+    hour_of_day = np.asarray(hours.hour)
+    active = (hour_of_day >= start) & (hour_of_day < end)
+
+    instance_count = np.where(active, params.gpu_count, 0).astype(np.int64)
+    gpu = np.where(
+        active,
+        params.gpu_utilization_active * unit_mean_lognormal(rng, params.sigma_cpu, n),
+        0.0,
+    )
+    gpu = np.clip(gpu, 0.0, 1.0)
+
+    # CPU on a GPU box tracks the job at a lower level; memory stays loaded
+    # while the job runs.
+    cpu = np.clip(gpu * 0.45 * unit_mean_lognormal(rng, params.sigma_cpu, n), 0.0, 1.0)
+    memory = np.where(active, params.memory_baseline, params.memory_baseline * 0.25)
+    memory = np.clip(memory * unit_mean_lognormal(rng, params.sigma_memory, n), 0.0, 1.0)
+
+    region = next(iter(params.region_weights))
+    return pd.DataFrame(
+        {
+            "resource_id": resource_id_for(service, region),
+            "region": region,
+            "hour": hours,
+            "instance_count": instance_count,
+            "cpu_utilization": cpu,
+            "memory_utilization": memory,
+            "gpu_utilization": gpu,
+            "request_count": np.zeros(n, dtype=np.int64),
+            "error_count": np.zeros(n, dtype=np.int64),
+            "latency_p50_ms": np.full(n, np.nan),
+            "latency_p99_ms": np.full(n, np.nan),
+        }
+    )
 
 
 def generate_capacity_and_reliability(
@@ -32,19 +296,91 @@ def generate_capacity_and_reliability(
     """Generate clean hourly resource metrics for one service from its demand.
 
     Args:
-        service: the Service (branch on `service.resource_kind` — see
-            module docstring for the ml-training-job exception).
-        demand: this service's output from workloads.demand.generate_demand
-            (needs at least the `requests` column).
-        rng: this component's Generator (same "workload" component as
-            demand.py — capacity is derived from demand, not an
-            independent random process, so reuse the same rng instance
-            the caller passed to generate_demand for this service).
+        service: the Service. Branches on `service.resource_kind`, not on the
+            name — BATCH_ACCELERATOR is schedule-driven (convention 8).
+        demand: this service's frame from workloads.demand.generate_demand,
+            indexed by hour. Only the `requests` column is read.
+        rng: this service's own capacity Generator — get it via
+            `rng_for(master_seed, f"capacity:{service.project}:{service.name}")`.
+            A separate stream from demand's, so a later change to demand's noise
+            cannot shift capacity's draws.
 
     Returns:
-        DataFrame indexed by `hour` with columns: instance_count (int),
-        cpu_utilization, memory_utilization (float, 0-1), gpu_utilization
-        (float 0-1, or None for non-GPU services), latency_p50_ms,
-        latency_p99_ms (float), request_count, error_count (int).
+        Long-format frame, one row per (resource_id, hour) — so 3x the rows of
+        `demand` for a three-region service, 1x for a single-region one. Columns:
+        resource_id, region, hour, instance_count, cpu_utilization,
+        memory_utilization, gpu_utilization, request_count, error_count,
+        latency_p50_ms, latency_p99_ms.
+
+        `gpu_utilization` is NaN for services with no GPU, and 0.0 for a GPU
+        resource that exists but is idle. `latency_*` is NaN where latency is
+        meaningless (batch jobs). Flat columns rather than a MultiIndex, since
+        billing.py groups by (region, sku).
+
+        Per-hour `request_count` summed across a service's resources matches
+        that hour's demand within +/- len(region_weights), from rounding each
+        region independently.
     """
-    raise NotImplementedError("TODO: implement the capacity/reliability formulas above")
+    params = params_for(service)
+    hours = pd.DatetimeIndex(demand.index)
+
+    if service.resource_kind is ResourceKind.BATCH_ACCELERATOR:
+        return _batch_frame(service, params, hours, rng)
+
+    requests = demand["requests"].to_numpy(dtype=float)
+    n = len(requests)
+    frames: list[pd.DataFrame] = []
+
+    # sorted(), not dict order — convention 7.
+    for region in sorted(params.region_weights):
+        weight = params.region_weights[region]
+        regional = requests * weight
+
+        needed = regional / (params.capacity_per_instance * params.target_utilization)
+        instance_count = np.clip(
+            np.ceil(needed), params.min_replicas, params.max_replicas
+        ).astype(np.int64)
+
+        # Derived back from instance_count, so utilization hovers near the
+        # setpoint and only wobbles from ceil rounding. That flatness is correct
+        # — it is what a healthy autoscaler looks like, and it is exactly the
+        # invariant the autoscaling-error incident breaks.
+        cpu = regional / (instance_count * params.capacity_per_instance)
+        cpu = np.clip(cpu * unit_mean_lognormal(rng, params.sigma_cpu, n), 1e-4, 1.0)
+
+        memory = params.memory_baseline + params.memory_elasticity * (
+            cpu - params.target_utilization
+        )
+        memory = np.clip(
+            memory * unit_mean_lognormal(rng, params.sigma_memory, n), 1e-4, 1.0
+        )
+
+        congestion = _congestion(cpu, params.target_utilization)
+        p50 = (
+            params.base_latency_p50_ms
+            * congestion
+            * unit_mean_lognormal(rng, params.sigma_latency, n)
+        )
+        p99 = p50 * params.p99_multiplier
+
+        error_count = rng.poisson(regional * params.base_error_rate).astype(np.int64)
+
+        frames.append(
+            pd.DataFrame(
+                {
+                    "resource_id": resource_id_for(service, region),
+                    "region": region,
+                    "hour": hours,
+                    "instance_count": instance_count,
+                    "cpu_utilization": cpu,
+                    "memory_utilization": memory,
+                    "gpu_utilization": np.full(n, np.nan),
+                    "request_count": np.rint(regional).astype(np.int64),
+                    "error_count": error_count,
+                    "latency_p50_ms": p50,
+                    "latency_p99_ms": p99,
+                }
+            )
+        )
+
+    return pd.concat(frames, ignore_index=True)
