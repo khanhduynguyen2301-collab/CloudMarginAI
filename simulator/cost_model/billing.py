@@ -138,6 +138,30 @@ _FIXED = {
 }
 
 
+def params_for(service: Service) -> BillingParams:
+    """Resolve billing intensities for `service`, scaling stored data on staging."""
+    try:
+        base = SERVICE_BILLING_PARAMS[service.name]
+    except KeyError as exc:
+        raise KeyError(
+            f"no billing parameters for service {service.name!r} — add an entry to "
+            "SERVICE_BILLING_PARAMS when the topology gains a service"
+        ) from exc
+    if service.project == "prod":
+        return base
+    return replace(base, storage_base_gb=base.storage_base_gb * STAGING_STORAGE_SCALE)
+
+
+def _storage_gb(
+    hours: pd.DatetimeIndex, params: BillingParams, run_start: pd.Timestamp
+) -> np.ndarray:
+    """Stored GB per hour: slow compounding growth from a base, anchored on run_start."""
+    elapsed_days = np.asarray((hours - run_start) / pd.Timedelta(days=1), dtype=float)
+    return params.storage_base_gb * (1.0 + params.storage_growth_per_week) ** (
+        elapsed_days / 7.0
+    )
+
+
 def usage_to_billing_rows(
     service: Service,
     demand: pd.DataFrame,
