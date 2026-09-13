@@ -198,25 +198,73 @@ def usage_to_billing_rows(
     demand: pd.DataFrame,
     metrics: pd.DataFrame,
     rng: np.random.Generator,
+    *,
+    run_start: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Generate clean billing_hourly rows (long format) for one service.
+    """Generate clean billing_hourly rows for one service, long format.
 
     Args:
         service: the Service being billed.
-        demand: output of workloads.demand.generate_demand for this service.
-        metrics: output of workloads.capacity.generate_capacity_and_reliability
-            for this service.
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "cost_noise")` (a
-            different component than "workload", per
-            simulator-architecture.md's seed hierarchy).
+        demand: this service's frame from workloads.demand. Kept for
+            symmetry with the other generators; every driver billing needs is
+            already per-region in `metrics`, so nothing is read from it today.
+        metrics: this service's frame from workloads.capacity — long format,
+            one row per (resource_id, hour), carrying region, instance_count and
+            request_count.
+        rng: this service's own cost Generator — get it via
+            `rng_for(master_seed, f"cost_noise:{service.project}:{service.name}")`.
+        run_start: first timestamp of the WHOLE run, even when `metrics` covers
+            a subset (demand.py convention 4). Anchors storage growth.
 
     Returns:
-        Long-format DataFrame with one row per (sku, hour): columns sku,
-        hour, usage_amount, usage_unit, credits, effective_cost. The
-        caller (cli.py) fills in organization_id, project_id, service,
-        region, currency, is_reconciled, source, schema_version,
-        ingested_at to produce full BillingHourlyRow instances (see
-        simulator/schema.py).
+        One row per (region, sku, hour), with every billing_hourly column filled:
+        organization_id, project_id, service, sku, region, hour, usage_amount,
+        usage_unit, credits, effective_cost, currency, is_reconciled, source,
+        schema_version, ingested_at. Regions and SKUs are iterated in sorted
+        order so the random stream does not depend on dict ordering.
+
+        effective_cost == usage_amount x unit_price x (1 - CREDIT_RATE) holds
+        to floating-point precision on every row (convention 9).
     """
-    raise NotImplementedError("TODO: implement the usage -> cost translation above")
+    del demand  # see Args — retained in the signature, unused
+    params = params_for(service)
+    frames: list[pd.DataFrame] = []
+
+    for region in sorted(metrics["region"].unique()):
+        region_metrics = metrics[metrics["region"] == region].sort_values("hour")
+        hours = pd.DatetimeIndex(region_metrics["hour"])
+        n = len(hours)
+        usage_by_sku = _usage_by_sku(service, params, region_metrics, region, run_start)
+
+        for sku in sorted(usage_by_sku):
+            price = SKU_PRICES[sku]
+            clean = usage_by_sku[sku]
+            # Convention 9: noise on usage, cost stays exact.
+            usage = clean * unit_mean_lognormal(rng, params.sigma_usage, n)
+            list_cost = usage * price.unit_price_usd
+            credits = list_cost * CREDIT_RATE
+            effective = list_cost - credits
+
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "organization_id": _FIXED["organization_id"],
+                        "project_id": service.project,
+                        "service": service.name,
+                        "sku": sku,
+                        "region": region,
+                        "hour": hours,
+                        "usage_amount": usage,
+                        "usage_unit": price.usage_unit,
+                        "credits": credits,
+                        "effective_cost": effective,
+                        "currency": _FIXED["currency"],
+                        "is_reconciled": _FIXED["is_reconciled"],
+                        "source": _FIXED["source"],
+                        "schema_version": _FIXED["schema_version"],
+                        "ingested_at": hours,  # convention 11
+                    }
+                )
+            )
+
+    return pd.concat(frames, ignore_index=True)
