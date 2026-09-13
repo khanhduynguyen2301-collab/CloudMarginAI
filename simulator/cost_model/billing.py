@@ -162,6 +162,37 @@ def _storage_gb(
     )
 
 
+def _usage_by_sku(
+    service: Service,
+    params: BillingParams,
+    region_metrics: pd.DataFrame,
+    region: str,
+    run_start: pd.Timestamp,
+) -> dict[str, np.ndarray]:
+    """Clean (pre-noise) usage per SKU for one region, as arrays aligned to hours."""
+    hours = pd.DatetimeIndex(region_metrics["hour"])
+    requests = region_metrics["request_count"].to_numpy(dtype=float)
+    instances = region_metrics["instance_count"].to_numpy(dtype=float)
+    usage: dict[str, np.ndarray] = {}
+
+    if service.resource_kind is ResourceKind.BATCH_ACCELERATOR:
+        usage["compute.gpu-hour"] = instances  # instance_count IS the GPU count
+    else:
+        usage["compute.vcpu-hour"] = instances * params.vcpu_per_instance
+
+    if params.egress_kb_per_request > 0:
+        usage["network.egress-gb"] = requests * params.egress_kb_per_request / 1e6
+    if params.log_kb_per_request > 0:
+        usage["logging.ingested-gb"] = requests * params.log_kb_per_request / 1e6
+    if params.db_cpu_ms_per_request > 0:
+        usage["db.cpu-hour"] = requests * params.db_cpu_ms_per_request / 3.6e6
+
+    if region == STORAGE_REGION:
+        usage["storage.standard-gb-month"] = _storage_gb(hours, params, run_start)
+
+    return usage
+
+
 def usage_to_billing_rows(
     service: Service,
     demand: pd.DataFrame,
