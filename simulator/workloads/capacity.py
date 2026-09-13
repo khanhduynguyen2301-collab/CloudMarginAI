@@ -177,6 +177,45 @@ SERVICE_CAPACITY_PARAMS: dict[str, CapacityParams] = {
 _WEIGHT_TOLERANCE = 1e-9
 
 
+def params_for(service: Service) -> CapacityParams:
+    """Resolve capacity constants for `service`, scaling replica bounds on staging.
+
+    Raises:
+        KeyError: if the topology gained a service with no entry here.
+        ValueError: if its region weights do not sum to 1.0 — a silent
+            mis-weighting would make per-resource request counts stop summing
+            back to the service's demand, and nothing else would notice.
+    """
+    try:
+        base = SERVICE_CAPACITY_PARAMS[service.name]
+    except KeyError as exc:
+        raise KeyError(
+            f"no capacity parameters for service {service.name!r} — add an entry to "
+            "SERVICE_CAPACITY_PARAMS when the topology gains a service"
+        ) from exc
+
+    total = sum(base.region_weights.values())
+    if abs(total - 1.0) > _WEIGHT_TOLERANCE:
+        raise ValueError(
+            f"region weights for {service.name!r} sum to {total!r}, expected 1.0"
+        )
+
+    if service.project == "prod":
+        return base
+    return replace(
+        base,
+        min_replicas=max(
+            STAGING_MIN_REPLICAS_FLOOR,
+            round(base.min_replicas * STAGING_REPLICA_SCALE),
+        ),
+        max_replicas=max(
+            STAGING_MAX_REPLICAS_FLOOR,
+            round(base.max_replicas * STAGING_REPLICA_SCALE),
+        ),
+        region_weights=dict(SINGLE_REGION_WEIGHTS),
+    )
+
+
 def resource_id_for(service: Service, region: str, ordinal: int = 1) -> str:
     """Deterministic resource identity — derived from topology, never the rng.
 
