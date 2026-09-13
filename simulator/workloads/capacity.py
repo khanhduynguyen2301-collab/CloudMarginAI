@@ -226,6 +226,65 @@ def resource_id_for(service: Service, region: str, ordinal: int = 1) -> str:
     return f"{service.project}-{service.name}-{region}-{ordinal:03d}"
 
 
+def _congestion(cpu: np.ndarray, target_utilization: float) -> np.ndarray:
+    """Latency multiplier from CPU pressure, normalized to 1.0 at the setpoint.
+
+    Climbs as CPU approaches saturation; the floor on the denominator stops it
+    diverging as cpu -> 1.
+    """
+    return (1.0 - target_utilization) / np.maximum(1.0 - cpu, 0.05)
+
+
+def _batch_frame(
+    service: Service,
+    params: CapacityParams,
+    hours: pd.DatetimeIndex,
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Schedule-driven metrics for a BATCH_ACCELERATOR service (convention 8).
+
+    instance_count and GPU utilization follow a fixed daily job window rather
+    than demand. Outside the window the GPUs are off: instance_count 0 and
+    gpu_utilization 0.0 — zero rather than NaN, because the resource exists and
+    is idle. NaN is reserved for services with no GPU at all.
+    """
+    n = len(hours)
+    start, end = params.job_window_utc
+    hour_of_day = np.asarray(hours.hour)
+    active = (hour_of_day >= start) & (hour_of_day < end)
+
+    instance_count = np.where(active, params.gpu_count, 0).astype(np.int64)
+    gpu = np.where(
+        active,
+        params.gpu_utilization_active * unit_mean_lognormal(rng, params.sigma_cpu, n),
+        0.0,
+    )
+    gpu = np.clip(gpu, 0.0, 1.0)
+
+    # CPU on a GPU box tracks the job at a lower level; memory stays loaded
+    # while the job runs.
+    cpu = np.clip(gpu * 0.45 * unit_mean_lognormal(rng, params.sigma_cpu, n), 0.0, 1.0)
+    memory = np.where(active, params.memory_baseline, params.memory_baseline * 0.25)
+    memory = np.clip(memory * unit_mean_lognormal(rng, params.sigma_memory, n), 0.0, 1.0)
+
+    region = next(iter(params.region_weights))
+    return pd.DataFrame(
+        {
+            "resource_id": resource_id_for(service, region),
+            "region": region,
+            "hour": hours,
+            "instance_count": instance_count,
+            "cpu_utilization": cpu,
+            "memory_utilization": memory,
+            "gpu_utilization": gpu,
+            "request_count": np.zeros(n, dtype=np.int64),
+            "error_count": np.zeros(n, dtype=np.int64),
+            "latency_p50_ms": np.full(n, np.nan),
+            "latency_p99_ms": np.full(n, np.nan),
+        }
+    )
+
+
 def generate_capacity_and_reliability(
     service: Service,
     demand: pd.DataFrame,
