@@ -293,19 +293,91 @@ def generate_capacity_and_reliability(
     """Generate clean hourly resource metrics for one service from its demand.
 
     Args:
-        service: the Service (branch on `service.resource_kind` — see
-            module docstring for the ml-training-job exception).
-        demand: this service's output from workloads.demand.generate_demand
-            (needs at least the `requests` column).
-        rng: this component's Generator (same "workload" component as
-            demand.py — capacity is derived from demand, not an
-            independent random process, so reuse the same rng instance
-            the caller passed to generate_demand for this service).
+        service: the Service. Branches on `service.resource_kind`, not on the
+            name — BATCH_ACCELERATOR is schedule-driven (convention 8).
+        demand: this service's frame from workloads.demand.generate_demand,
+            indexed by hour. Only the `requests` column is read.
+        rng: this service's own capacity Generator — get it via
+            `rng_for(master_seed, f"capacity:{service.project}:{service.name}")`.
+            A separate stream from demand's, so a later change to demand's noise
+            cannot shift capacity's draws.
 
     Returns:
-        DataFrame indexed by `hour` with columns: instance_count (int),
-        cpu_utilization, memory_utilization (float, 0-1), gpu_utilization
-        (float 0-1, or None for non-GPU services), latency_p50_ms,
-        latency_p99_ms (float), request_count, error_count (int).
+        Long-format frame, one row per (resource_id, hour) — so 3x the rows of
+        `demand` for a three-region service, 1x for a single-region one. Columns:
+        resource_id, region, hour, instance_count, cpu_utilization,
+        memory_utilization, gpu_utilization, request_count, error_count,
+        latency_p50_ms, latency_p99_ms.
+
+        `gpu_utilization` is NaN for services with no GPU, and 0.0 for a GPU
+        resource that exists but is idle. `latency_*` is NaN where latency is
+        meaningless (batch jobs). Flat columns rather than a MultiIndex, since
+        billing.py groups by (region, sku).
+
+        Per-hour `request_count` summed across a service's resources matches
+        that hour's demand within +/- len(region_weights), from rounding each
+        region independently.
     """
-    raise NotImplementedError("TODO: implement the capacity/reliability formulas above")
+    params = params_for(service)
+    hours = pd.DatetimeIndex(demand.index)
+
+    if service.resource_kind is ResourceKind.BATCH_ACCELERATOR:
+        return _batch_frame(service, params, hours, rng)
+
+    requests = demand["requests"].to_numpy(dtype=float)
+    n = len(requests)
+    frames: list[pd.DataFrame] = []
+
+    # sorted(), not dict order — convention 7.
+    for region in sorted(params.region_weights):
+        weight = params.region_weights[region]
+        regional = requests * weight
+
+        needed = regional / (params.capacity_per_instance * params.target_utilization)
+        instance_count = np.clip(
+            np.ceil(needed), params.min_replicas, params.max_replicas
+        ).astype(np.int64)
+
+        # Derived back from instance_count, so utilization hovers near the
+        # setpoint and only wobbles from ceil rounding. That flatness is correct
+        # — it is what a healthy autoscaler looks like, and it is exactly the
+        # invariant the autoscaling-error incident breaks.
+        cpu = regional / (instance_count * params.capacity_per_instance)
+        cpu = np.clip(cpu * unit_mean_lognormal(rng, params.sigma_cpu, n), 1e-4, 1.0)
+
+        memory = params.memory_baseline + params.memory_elasticity * (
+            cpu - params.target_utilization
+        )
+        memory = np.clip(
+            memory * unit_mean_lognormal(rng, params.sigma_memory, n), 1e-4, 1.0
+        )
+
+        congestion = _congestion(cpu, params.target_utilization)
+        p50 = (
+            params.base_latency_p50_ms
+            * congestion
+            * unit_mean_lognormal(rng, params.sigma_latency, n)
+        )
+        p99 = p50 * params.p99_multiplier
+
+        error_count = rng.poisson(regional * params.base_error_rate).astype(np.int64)
+
+        frames.append(
+            pd.DataFrame(
+                {
+                    "resource_id": resource_id_for(service, region),
+                    "region": region,
+                    "hour": hours,
+                    "instance_count": instance_count,
+                    "cpu_utilization": cpu,
+                    "memory_utilization": memory,
+                    "gpu_utilization": np.full(n, np.nan),
+                    "request_count": np.rint(regional).astype(np.int64),
+                    "error_count": error_count,
+                    "latency_p50_ms": p50,
+                    "latency_p99_ms": p99,
+                }
+            )
+        )
+
+    return pd.concat(frames, ignore_index=True)
