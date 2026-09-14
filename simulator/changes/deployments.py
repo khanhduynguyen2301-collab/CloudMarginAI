@@ -72,6 +72,28 @@ RELEASE_ACTORS: tuple[str, ...] = (
 MINOR_BUMP_PROBABILITY = 0.18
 
 
+def mean_days_for(service: Service) -> float:
+    return MEAN_DAYS_BETWEEN_RELEASES.get(service.name, DEFAULT_MEAN_DAYS_BETWEEN_RELEASES)
+
+
+def _hour_weights(hours: pd.DatetimeIndex) -> np.ndarray:
+    """Relative deployment likelihood per hour of the run."""
+    hour_of_day = np.asarray(hours.hour)
+    day_of_week = np.asarray(hours.dayofweek)
+
+    weights = np.full(len(hours), WEIGHT_OFF_HOURS)
+    in_business = np.isin(hour_of_day, list(BUSINESS_HOURS_UTC))
+    weights[in_business] = WEIGHT_BUSINESS_HOURS
+    weights[day_of_week >= 5] = WEIGHT_WEEKEND
+    return weights / weights.sum()
+
+
+def _next_version(major: int, minor: int, patch: int, bump_minor: bool) -> tuple[int, int, int]:
+    if bump_minor:
+        return major, minor + 1, 0
+    return major, minor, patch + 1
+
+
 def generate_deployments(
     service: Service,
     hours: pd.DatetimeIndex,
