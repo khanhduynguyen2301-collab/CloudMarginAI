@@ -32,6 +32,7 @@ from simulator.workloads.capacity import resource_id_for
 
 SCHEMA_VERSION = "1"
 
+
 MEAN_DAYS_BETWEEN_CHANGES = 20.0
 
 # Benign change types with the config shape each one edits. "schedule_removed"
@@ -55,6 +56,27 @@ CHANGE_ACTORS: tuple[str, ...] = (
 _COST_CENTRES: tuple[str, ...] = ("cc-1042", "cc-1108", "cc-2270")
 _TIERS: tuple[str, ...] = ("gold", "silver", "bronze")
 _BUDGET_ALERTS: tuple[int, ...] = (5, 15, 25)
+
+
+def _config_pair(change_type: str, rng: np.random.Generator) -> tuple[dict, dict]:
+    """before/after JSON for a benign change. Both sides are always populated so
+    a consumer never has to guess what a null means."""
+    if change_type == "update_label":
+        before, after = rng.choice(_COST_CENTRES, size=2, replace=False)
+        return {"labels": {"cost-centre": str(before)}}, {"labels": {"cost-centre": str(after)}}
+    if change_type == "update_tag":
+        before, after = rng.choice(_TIERS, size=2, replace=False)
+        return {"tags": {"tier": str(before)}}, {"tags": {"tier": str(after)}}
+    if change_type == "update_description":
+        return {"description": "owned by platform"}, {
+            "description": "owned by platform (see runbook)"
+        }
+    if change_type == "update_budget_alert":
+        before, after = rng.choice(_BUDGET_ALERTS, size=2, replace=False)
+        return {"budget_alert_usd": int(before)}, {"budget_alert_usd": int(after)}
+    if change_type == "rotate_service_account_key":
+        return {"key_version": 1}, {"key_version": 2}
+    raise ValueError(f"no config shape defined for change_type {change_type!r}")
 
 
 def generate_resource_changes(
