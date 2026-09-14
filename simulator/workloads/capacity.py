@@ -95,7 +95,7 @@ class CapacityParams:
     sigma_cpu: float = 0.03
     sigma_latency: float = 0.05
     sigma_memory: float = 0.02
-    
+
     # --- BATCH_ACCELERATOR only ---
     gpu_count: int = 0
     job_window_utc: tuple[int, int] = (2, 6)   # [start, end) hour, UTC
