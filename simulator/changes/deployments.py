@@ -102,14 +102,53 @@ def generate_deployments(
     """Generate the background deployment history for one service over `hours`.
 
     Args:
-        service: the Service releasing deployments.
+        service: the Service releasing. Returns an empty list for any project
+            other than "prod" — convention 13.
         hours: the full run's hourly timestamp index (UTC).
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "changes")`.
+        rng: this service's own changes Generator — get it via
+            `rng_for(master_seed, f"changes:{service.project}:{service.name}")`.
 
     Returns:
-        List of DeploymentRow (organization_id/schema_version/ingested_at
-        can be filled with placeholder/constant values here and
-        overwritten by the caller if needed).
+        DeploymentRow list, ordered by released_at, versions monotonically
+        increasing. Never contains a reserved changed_component (convention 12).
+        At most one release per hour, since the run's hours are sampled without
+        replacement.
     """
-    raise NotImplementedError("TODO: implement the Poisson-ish deployment cadence above")
+    if service.project != "prod":
+        return []
+
+    n_hours = len(hours)
+    if n_hours == 0:
+        return []
+
+    days = n_hours / 24.0
+    expected = days / mean_days_for(service)
+    count = int(rng.poisson(expected))
+    count = min(count, n_hours)  # cannot place more releases than there are hours
+    if count == 0:
+        return []
+
+    positions = rng.choice(n_hours, size=count, replace=False, p=_hour_weights(hours))
+    positions.sort()
+
+    major, minor, patch = 2, 0, 0
+    rows: list[DeploymentRow] = []
+    for ordinal, position in enumerate(positions, start=1):
+        released_at = hours[position]
+        major, minor, patch = _next_version(
+            major, minor, patch, bool(rng.random() < MINOR_BUMP_PROBABILITY)
+        )
+        rows.append(
+            DeploymentRow(
+                organization_id=ORGANIZATION_ID,
+                service=service.name,
+                deployment_id=f"dep-{service.name}-{ordinal:04d}",
+                released_at=released_at,
+                version=f"v{major}.{minor}.{patch}",
+                changed_component=str(rng.choice(CHANGED_COMPONENTS)),
+                actor=str(rng.choice(RELEASE_ACTORS)),
+                schema_version=SCHEMA_VERSION,
+                ingested_at=released_at,  # convention 11: never the wall clock
+            )
+        )
+    return rows
