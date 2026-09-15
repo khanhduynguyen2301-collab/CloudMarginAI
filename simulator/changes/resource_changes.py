@@ -87,16 +87,51 @@ def generate_resource_changes(
     """Generate the background configuration-change history for one service.
 
     Args:
-        service: the Service whose resources are changing.
+        service: the Service whose resources are changing. Covers every project,
+            unlike deployments.py.
         hours: the full run's hourly timestamp index (UTC).
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "changes")` (same
-            component as deployments.py — both are "background change
-            noise").
+        rng: this service's own changes Generator — get it via
+            `rng_for(master_seed, f"changes:{service.project}:{service.name}")`.
 
     Returns:
-        List of ResourceChangeRow with benign change_type values (e.g.
-        "update_label", "update_tag") and before_config/after_config
-        JSON-serializable dicts.
+        ResourceChangeRow list ordered by changed_at, each pointing at a real
+        resource_id from capacity.py and carrying a populated
+        before_config/after_config pair. Never contains a reserved change_type
+        (convention 12).
     """
-    raise NotImplementedError("TODO: implement the background config-change rate above")
+    n_hours = len(hours)
+    if n_hours == 0:
+        return []
+
+    regions = sorted(capacity_params_for(service).region_weights)
+    resource_ids = [resource_id_for(service, region) for region in regions]
+
+    days = n_hours / 24.0
+    expected = days / MEAN_DAYS_BETWEEN_CHANGES * len(resource_ids)
+    count = min(int(rng.poisson(expected)), n_hours)
+    if count == 0:
+        return []
+
+    positions = rng.choice(n_hours, size=count, replace=False)
+    positions.sort()
+
+    rows: list[ResourceChangeRow] = []
+    for ordinal, position in enumerate(positions, start=1):
+        changed_at = hours[position]
+        change_type = str(rng.choice(BENIGN_CHANGE_TYPES))
+        before, after = _config_pair(change_type, rng)
+        rows.append(
+            ResourceChangeRow(
+                organization_id=ORGANIZATION_ID,
+                project_id=service.project,
+                resource_id=str(rng.choice(resource_ids)),
+                changed_at=changed_at,
+                change_type=change_type,
+                actor=str(rng.choice(CHANGE_ACTORS)),
+                before_config=before,
+                after_config=after,
+                schema_version=SCHEMA_VERSION,
+                ingested_at=changed_at,  # convention 11: never the wall clock
+            )
+        )
+    return rows
