@@ -110,12 +110,60 @@ def write_ground_truth(rows: list[GroundTruthIncidentRow], output_dir: Path) -> 
     """Write all ground_truth_incidents rows for a run to `output_dir`.
 
     Args:
-        rows: one GroundTruthIncidentRow per injected incident (should be
-            exactly 10 for a full run, per incident-injection-spec.md).
-        output_dir: the run's output directory (same one manifest.json
-            goes into — see simulator/cli.py).
+        rows: one GroundTruthIncidentRow per injected incident (exactly 10 for a
+            full run, per incident-injection-spec.md). Written in the order
+            given, which for a normal run is `place_incidents`' order: train,
+            then validation, then test.
+        output_dir: the run's output directory - the same one manifest.json goes
+            into. The file lands in a `ground_truth/` subdirectory of it
+            (convention 18), which is created if it does not exist.
 
     Returns:
         The path written to.
+
+    Raises:
+        ValueError: `rows` is empty, or two rows share a ground_truth_id. Both
+            mean the run produced an unusable evaluation table, and both stay
+            silent if left to a downstream join - a duplicated id makes one
+            incident score twice and another vanish.
+        TypeError: a field is not JSON-serializable (see `_jsonable`).
     """
-    raise NotImplementedError("TODO: serialize rows (e.g. to parquet or JSON lines)")
+    if not rows:
+        raise ValueError(
+            "refusing to write an empty ground_truth_incidents table - a run with no "
+            "injected incidents cannot satisfy the M1 exit criteria, and an empty file "
+            "would pass a downstream join silently"
+        )
+    duplicates = [gt_id for gt_id, n in Counter(r.ground_truth_id for r in rows).items() if n > 1]
+    if duplicates:
+        raise ValueError(f"duplicate ground_truth_id(s): {sorted(duplicates)}")
+
+    path = ground_truth_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(_to_record(row), ensure_ascii=False) + "\n")
+    return path
+
+
+def read_ground_truth(output_dir: Path) -> list[GroundTruthIncidentRow]:
+    """Load a run's ground truth back. FOR EVALUATION CODE ONLY.
+
+    Phase 2's backtest harness and Phase 3's ranker scorer are the only
+    permitted callers. Nothing that builds features, and nothing a detector
+    runs, may call this.
+
+    Raises:
+        FileNotFoundError: no ground truth was written for this run - which
+            means the run is not evaluable, not that it had no incidents, since
+            `write_ground_truth` refuses to write an empty table.
+    """
+    path = ground_truth_path(output_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no ground truth at {path} - the run either did not complete or was written "
+            "by something other than labels.ground_truth"
+        )
+    with path.open(encoding="utf-8") as handle:
+        return [_from_record(json.loads(line)) for line in handle if line.strip()]
+
