@@ -34,16 +34,29 @@ class IncidentSpec:
     def expected_magnitude(self, sampled_value: float, **extra: float) -> dict:
         """Build the `expected_magnitude` JSON for a ground_truth_incidents row.
 
-        `extra` carries a second value for incident types that need one
-        (query_regression needs both latency_delta_pct and
-        cost_delta_pct — see docs/phase0/incident-catalogue.md /
-        docs/phase1/incident-injection-spec.md for exactly which key(s)
-        each incident type uses).
+        Only LOGGING_REGRESSION records its input parameter. The other three
+        record OUTCOMES, which incidents/engine.py measures by differencing the
+        injected frames against the clean ones and passes in via `extra`
+        (engine.py convention 15). `sampled_value` is therefore used by exactly
+        one branch here and ignored by the rest.
+
+        Raises:
+            KeyError: `extra` is missing a measurement this incident type
+                needs. A loud failure beats a ground-truth row with a silently
+                absent magnitude, which evaluation code would read as real.
         """
-        raise NotImplementedError(
-            "TODO: return the correct JSON shape for this incident_type, e.g. "
-            '{"log_byte_multiplier": sampled_value} for LOGGING_REGRESSION'
-        )
+        if self.incident_type is IncidentType.LOGGING_REGRESSION:
+            return {"log_byte_multiplier": float(sampled_value)}
+        if self.incident_type is IncidentType.QUERY_REGRESSION:
+            return {
+                "latency_delta_pct": float(extra["latency_delta_pct"]),
+                "cost_delta_pct": float(extra["cost_delta_pct"]),
+            }
+        if self.incident_type is IncidentType.IDLE_ACCELERATOR:
+            return {"idle_cost_rate": float(extra["idle_cost_rate"])}
+        if self.incident_type is IncidentType.AUTOSCALING_ERROR:
+            return {"instance_count_delta": float(extra["instance_count_delta"])}
+        raise ValueError(f"no expected_magnitude shape for {self.incident_type!r}")
 
 
 INCIDENT_SPECS: dict[IncidentType, IncidentSpec] = {
