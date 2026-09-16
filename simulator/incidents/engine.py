@@ -158,6 +158,38 @@ MIN_GAP_HOURS_SAME_SERVICE = 48
 PLACEMENT_MAX_ATTEMPTS = 2000
 
 
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def window_end(start_ts, duration_hours: int) -> pd.Timestamp:
+    """Exclusive end of an incident window. Windows are half-open [start, end)."""
+    return pd.Timestamp(start_ts) + pd.Timedelta(hours=int(duration_hours))
+
+
+def _mask(frame: pd.DataFrame, start_ts, duration_hours: int) -> np.ndarray:
+    hour = pd.DatetimeIndex(frame["hour"])
+    start = pd.Timestamp(start_ts)
+    return np.asarray((hour >= start) & (hour < window_end(start, duration_hours)))
+
+
+def _sku_rows(frame: pd.DataFrame, start_ts, duration_hours: int, sku: str) -> np.ndarray:
+    return _mask(frame, start_ts, duration_hours) & (frame["sku"] == sku).to_numpy()
+
+
+def _recost(billing: pd.DataFrame, rows: np.ndarray) -> None:
+    """Rebuild credits/effective_cost from usage_amount on `rows` (convention 16)."""
+    prices = np.array(
+        [SKU_PRICES[sku].unit_price_usd for sku in billing.loc[rows, "sku"]], dtype=float
+    )
+    list_cost = billing.loc[rows, "usage_amount"].to_numpy(dtype=float) * prices
+    billing.loc[rows, "credits"] = list_cost * CREDIT_RATE
+    billing.loc[rows, "effective_cost"] = list_cost * (1.0 - CREDIT_RATE)
+
+
+def _cost_of(billing: pd.DataFrame, rows: np.ndarray) -> float:
+    return float(billing.loc[rows, "effective_cost"].sum())
 def inject(
     incident_type: IncidentType,
     service: Service,
