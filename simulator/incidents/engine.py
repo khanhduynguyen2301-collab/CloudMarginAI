@@ -457,6 +457,11 @@ def _causal_event(
     )
 
 
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
+
+
 def inject(
     incident_type: IncidentType,
     service: Service,
@@ -471,6 +476,7 @@ def inject(
     organization_id: str,
     chronological_split: str,
     simulator_seed: int,
+    ordinal: int = 1,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
@@ -478,26 +484,69 @@ def inject(
     DeploymentRow | ResourceChangeRow,
     GroundTruthIncidentRow,
 ]:
-    """Mutate `demand`/`metrics`/`billing` in place for [start_ts, start_ts + duration_hours)
-    per this incident_type's spec (simulator.incidents.types.INCIDENT_SPECS),
-    write the causal event using CAUSAL_EVENT_TAG, and build the
-    ground_truth_incidents row.
+    """Inject one incident into a service's clean frames.
 
     Args:
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "incidents")`.
+        incident_type, service, start_ts, duration_hours, magnitude: one tuple
+            as returned by `place_incidents`.
+        demand: this service's frame from workloads.demand. Returned unchanged -
+            no incident type touches traffic (convention 17).
+        metrics: this service's long frame from workloads.capacity.
+        billing: this service's long frame from cost_model.billing.
+        rng: this component's Generator - get it via
+            `simulator.seeding.rng_for(master_seed, "incidents")`. The SAME
+            Generator instance must be threaded through `place_incidents` and
+            then every `inject` call, in the order placement returned them, or
+            the run stops being reproducible.
+        organization_id, chronological_split, simulator_seed: written straight
+            onto the ground-truth row.
+        ordinal: 1-based index of this incident within the run; sets
+            `ground_truth_id` and the provisional causal deployment_id.
 
     Returns:
-        (demand, metrics, billing, causal_event, ground_truth_row) — the
-        first three are the same DataFrames passed in, mutated; decide and
-        document whether you mutate in place or return copies, and use
-        that convention consistently across all four incident types.
+        (demand, metrics, billing, causal_event, ground_truth_row). `metrics`
+        and `billing` are NEW frames - the inputs are not modified (convention
+        14) - and `demand` is the same object that was passed in.
+
+    Raises:
+        ValueError: `service` is not this incident type's home service.
     """
-    raise NotImplementedError(
-        "TODO: implement the four incident-type-specific mutations "
-        "(see docs/phase1/incident-injection-spec.md, 'The four incident "
-        "types, operationalized' for the exact parameter each type mutates)"
+    spec = INCIDENT_SPECS[incident_type]
+    if service.name != spec.service_name:
+        raise ValueError(
+            f"{incident_type.value} targets {spec.service_name!r}, got {service.name!r} - "
+            "the incident-to-service mapping lives in topology.INCIDENT_SERVICE_MAP"
+        )
+
+    metrics = metrics.copy()
+    billing = billing.copy()
+
+    extra = _MUTATIONS[incident_type](
+        service, metrics, billing, start_ts, duration_hours, magnitude, rng
     )
+    causal = _causal_event(incident_type, service, pd.Timestamp(start_ts), ordinal, rng)
+
+    # The spec names a RESOURCE for idle_accelerator and a SERVICE for the other
+    # three; affected_service_or_resource follows it either way.
+    affected = (
+        resource_id_for(service, next(iter(capacity_params_for(service).region_weights)))
+        if incident_type is IncidentType.IDLE_ACCELERATOR
+        else service.name
+    )
+    ground_truth = GroundTruthIncidentRow(
+        ground_truth_id=f"GT-{ordinal:04d}",
+        organization_id=organization_id,
+        incident_type=incident_type.value,
+        affected_service_or_resource=affected,
+        injected_at=pd.Timestamp(start_ts),
+        duration_hours=int(duration_hours),
+        expected_magnitude=spec.expected_magnitude(magnitude, **extra),
+        expected_safe_remediation=spec.safe_remediation,
+        chronological_split=chronological_split,
+        simulator_seed=simulator_seed,
+        schema_version=SCHEMA_VERSION,
+    )
+    return demand, metrics, billing, causal, ground_truth
 
 
 def place_incidents(
@@ -508,20 +557,79 @@ def place_incidents(
 ) -> list[tuple[IncidentType, Service, datetime, int, float]]:
     """Decide how many incidents, of which type, on which service, starting when.
 
-    Implements the "Count and placement" table: 10 incidents total
-    (2-3 per type), 6/2/2 across train/validation/test, exactly one
-    logging_regression in test. Enforce non-overlap: no two incidents
-    share a time window on the same service, and no window crosses a
-    split boundary.
+    Follows SPLIT_ALLOCATION rather than sampling counts, so 6/2/2 and "exactly
+    one logging_regression in test" hold for every seed. Only the durations,
+    magnitudes and start hours are drawn.
+
+    Each start is rejection-sampled until the whole window fits inside its split
+    - with room at the front for the causal event's lead - and sits at least
+    MIN_GAP_HOURS_SAME_SERVICE away from every window already placed on the same
+    service. Since each incident type has exactly one home service, that gap
+    rule binds only on the two types placed twice in train.
 
     Args:
-        rng: this component's Generator — get it via
-            `simulator.seeding.rng_for(master_seed, "incidents")` (same
-            component as `inject` — placement and magnitude sampling are
-            both part of the "incidents" random stream).
+        topology: resolves each incident type's home service, always in prod.
+        hours: the run's hourly index (UTC). Starts are drawn from it, so every
+            injected_at is a real run hour.
+        split_boundaries: {"train"|"validation"|"test": (start, end)}, half-open
+            [start, end).
+        rng: this component's Generator - `rng_for(master_seed, "incidents")`.
+            Thread the same instance into `inject` afterwards.
 
     Returns:
-        List of (incident_type, service, start_ts, duration_hours,
-        magnitude) tuples, one per incident, ready to pass to `inject`.
+        10 (incident_type, service, start_ts, duration_hours, magnitude) tuples
+        in split order - and `inject` must be called in that same order.
+
+    Raises:
+        KeyError: a split named in SPLIT_ALLOCATION has no boundaries.
+        RuntimeError: a window could not be placed. That means a duration range
+            no longer fits its split, which is a spec conflict to resolve in
+            docs/phase1/incident-injection-spec.md - not a bad seed to retry.
     """
-    raise NotImplementedError("TODO: implement the placement/scheduling algorithm above")
+    placed: list[tuple[IncidentType, Service, datetime, int, float]] = []
+    per_service: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+    gap = pd.Timedelta(hours=MIN_GAP_HOURS_SAME_SERVICE)
+
+    for split in SPLIT_ORDER:
+        try:
+            raw_start, raw_end = split_boundaries[split]
+        except KeyError as exc:
+            raise KeyError(
+                f"split_boundaries is missing {split!r} - it must cover {SPLIT_ORDER}, "
+                "per docs/phase1/simulator-architecture.md"
+            ) from exc
+        split_start = pd.Timestamp(raw_start)
+        split_end = pd.Timestamp(raw_end)
+
+        for incident_type in SPLIT_ALLOCATION[split]:
+            spec = INCIDENT_SPECS[incident_type]
+            service = topology.get_service(spec.service_name, project="prod")
+            duration = int(rng.integers(spec.duration_hours_low, spec.duration_hours_high + 1))
+            magnitude = float(rng.uniform(spec.magnitude_low, spec.magnitude_high))
+
+            earliest = split_start + pd.Timedelta(hours=CAUSAL_LEAD_HOURS_HIGH)
+            latest = split_end - pd.Timedelta(hours=duration)
+            slots = hours[(hours >= earliest) & (hours <= latest)]
+            if len(slots) == 0:
+                raise RuntimeError(
+                    f"{incident_type.value} duration {duration}h does not fit split "
+                    f"{split!r} ({split_start} to {split_end})"
+                )
+
+            busy = per_service.setdefault(service.name, [])
+            for _ in range(PLACEMENT_MAX_ATTEMPTS):
+                start = pd.Timestamp(slots[int(rng.integers(len(slots)))])
+                end = window_end(start, duration)
+                if all(start >= b + gap or end + gap <= a for a, b in busy):
+                    busy.append((start, end))
+                    placed.append((incident_type, service, start, duration, magnitude))
+                    break
+            else:
+                raise RuntimeError(
+                    f"could not place {incident_type.value} in split {split!r} after "
+                    f"{PLACEMENT_MAX_ATTEMPTS} attempts (duration {duration}h, "
+                    f"{len(busy)} window(s) already on {service.name}) - the split is too "
+                    "short for this type's duration range plus the same-service gap"
+                )
+
+    return placed
