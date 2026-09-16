@@ -190,6 +190,211 @@ def _recost(billing: pd.DataFrame, rows: np.ndarray) -> None:
 
 def _cost_of(billing: pd.DataFrame, rows: np.ndarray) -> float:
     return float(billing.loc[rows, "effective_cost"].sum())
+
+
+# ---------------------------------------------------------------------------
+# the four mutations
+# ---------------------------------------------------------------------------
+
+
+def _inject_logging_regression(
+    service: Service,
+    metrics: pd.DataFrame,
+    billing: pd.DataFrame,
+    start_ts,
+    duration_hours: int,
+    magnitude: float,
+    rng: np.random.Generator,
+) -> dict:
+    """Log verbosity multiplier on logging.ingested-gb usage.
+
+    Traffic is untouched, so `metrics` is not modified at all: cost rises while
+    every resource metric stays exactly on its clean path. That dissociation is
+    the whole signature - and it is why this type is the M2 milestone, since
+    nothing but the cost series can find it.
+    """
+    del service, metrics, rng
+    rows = _sku_rows(billing, start_ts, duration_hours, "logging.ingested-gb")
+    billing.loc[rows, "usage_amount"] *= magnitude
+    _recost(billing, rows)
+    return {}  # log_byte_multiplier is the input parameter, recorded directly
+
+
+def _inject_query_regression(
+    service: Service,
+    metrics: pd.DataFrame,
+    billing: pd.DataFrame,
+    start_ts,
+    duration_hours: int,
+    magnitude: float,
+    rng: np.random.Generator,
+) -> dict:
+    """Queries-per-request multiplier on db.cpu-hour, plus a correlated latency rise.
+
+    The latency multiplier is a second, independent draw inside the doc's
+    1.5-2.5x band: the spec gives the two magnitudes separate ranges, so they
+    are not one number wearing two hats.
+    """
+    del service
+    latency_mult = float(rng.uniform(QUERY_LATENCY_MULT_LOW, QUERY_LATENCY_MULT_HIGH))
+
+    window = _mask(billing, start_ts, duration_hours)
+    clean_cost = _cost_of(billing, window)
+    db_rows = window & (billing["sku"] == "db.cpu-hour").to_numpy()
+    billing.loc[db_rows, "usage_amount"] *= magnitude
+    _recost(billing, db_rows)
+    dirty_cost = _cost_of(billing, window)
+
+    metric_rows = _mask(metrics, start_ts, duration_hours)
+    metrics.loc[metric_rows, "latency_p99_ms"] *= latency_mult
+    metrics.loc[metric_rows, "latency_p50_ms"] *= np.sqrt(latency_mult)
+
+    return {
+        "latency_delta_pct": (latency_mult - 1.0) * 100.0,
+        "cost_delta_pct": (dirty_cost / clean_cost - 1.0) * 100.0,
+    }
+
+
+def _inject_idle_accelerator(
+    service: Service,
+    metrics: pd.DataFrame,
+    billing: pd.DataFrame,
+    start_ts,
+    duration_hours: int,
+    magnitude: float,
+    rng: np.random.Generator,
+) -> dict:
+    """The job's schedule is forced "active": GPUs stay allocated around the
+    clock with utilization pinned below 5%.
+
+    Off-window hours are where the money goes - the clean frame has
+    instance_count 0 there, so both the metric and the GPU-hour usage have to be
+    created rather than scaled (convention 14's one exception). Hours inside the
+    normal job window keep their billing untouched; only their utilization
+    collapses, which is what tells a detector the job is running empty rather
+    than merely running long.
+    """
+    params = capacity_params_for(service)
+    rows = _mask(metrics, start_ts, duration_hours)
+    n = int(rows.sum())
+    if n == 0:
+        return {"idle_cost_rate": 0.0}
+
+    was_off = metrics.loc[rows, "instance_count"].to_numpy() == 0
+    held = np.clip(
+        magnitude * unit_mean_lognormal(rng, params.sigma_cpu, n),
+        0.0,
+        _IDLE_UTILIZATION_CEILING,
+    )
+    metrics.loc[rows, "gpu_utilization"] = held
+    metrics.loc[rows, "cpu_utilization"] = held * _BATCH_CPU_PER_GPU
+    metrics.loc[rows, "instance_count"] = params.gpu_count
+    memory = metrics.loc[rows, "memory_utilization"].to_numpy(dtype=float)
+    metrics.loc[rows, "memory_utilization"] = np.clip(
+        np.where(was_off, memory / _BATCH_IDLE_MEMORY_FRACTION, memory), 0.0, 1.0
+    )
+
+    gpu_rows = _sku_rows(billing, start_ts, duration_hours, "compute.gpu-hour")
+    clean_gpu_cost = _cost_of(billing, gpu_rows)
+    usage = billing.loc[gpu_rows, "usage_amount"].to_numpy(dtype=float, copy=True)
+    idle_hours = usage == 0.0
+    usage[idle_hours] = params.gpu_count * unit_mean_lognormal(
+        rng, _BATCH_USAGE_SIGMA, int(idle_hours.sum())
+    )
+    billing.loc[gpu_rows, "usage_amount"] = usage
+    _recost(billing, gpu_rows)
+
+    wasted = _cost_of(billing, gpu_rows) - clean_gpu_cost
+    return {"idle_cost_rate": wasted / float(duration_hours)}
+
+
+def _inject_autoscaling_error(
+    service: Service,
+    metrics: pd.DataFrame,
+    billing: pd.DataFrame,
+    start_ts,
+    duration_hours: int,
+    magnitude: float,
+    rng: np.random.Generator,
+) -> dict:
+    """min_replicas raised 3-5x, decoupling instance_count from requests.
+
+    capacity.py computes instance_count as clip(ceil(needed), min_replicas,
+    max_replicas). Raising only the floor is therefore exactly
+    min(max(clean, raised_floor), max_replicas) - no need to recover `needed`
+    from the rounded request_count, and no rounding drift.
+
+    Everything downstream follows by ratio: CPU is derived from instance_count
+    so it falls by old/new, latency follows CPU through the same congestion
+    curve, memory follows CPU through its elasticity, and vCPU-hour usage rises
+    by new/old. The result is the correlated signature the spec asks for - cost
+    up, utilization down, latency slightly BETTER - which is exactly what
+    separates this from a genuine traffic surge.
+    """
+    del rng
+    params = capacity_params_for(service)
+    raised_floor = min(int(round(params.min_replicas * magnitude)), params.max_replicas)
+
+    rows = _mask(metrics, start_ts, duration_hours)
+    clean_instances = metrics.loc[rows, "instance_count"].to_numpy(dtype=float)
+    new_instances = np.minimum(
+        np.maximum(clean_instances, float(raised_floor)), float(params.max_replicas)
+    )
+
+    clean_cpu = metrics.loc[rows, "cpu_utilization"].to_numpy(dtype=float)
+    new_cpu = np.clip(clean_cpu * (clean_instances / new_instances), 1e-4, 1.0)
+
+    metrics.loc[rows, "instance_count"] = new_instances.astype(np.int64)
+    metrics.loc[rows, "cpu_utilization"] = new_cpu
+    metrics.loc[rows, "memory_utilization"] = np.clip(
+        metrics.loc[rows, "memory_utilization"].to_numpy(dtype=float)
+        + params.memory_elasticity * (new_cpu - clean_cpu),
+        1e-4,
+        1.0,
+    )
+    congestion_ratio = _congestion(new_cpu, params.target_utilization) / _congestion(
+        clean_cpu, params.target_utilization
+    )
+    metrics.loc[rows, "latency_p50_ms"] *= congestion_ratio
+    metrics.loc[rows, "latency_p99_ms"] *= congestion_ratio
+
+    # Scale vCPU-hour usage by the same instance ratio, matched on (region, hour).
+    scale = pd.Series(
+        new_instances / clean_instances,
+        index=pd.MultiIndex.from_arrays(
+            [
+                metrics.loc[rows, "region"].to_numpy(),
+                pd.DatetimeIndex(metrics.loc[rows, "hour"]),
+            ]
+        ),
+    )
+    cpu_rows = _sku_rows(billing, start_ts, duration_hours, "compute.vcpu-hour")
+    key = pd.MultiIndex.from_arrays(
+        [
+            billing.loc[cpu_rows, "region"].to_numpy(),
+            pd.DatetimeIndex(billing.loc[cpu_rows, "hour"]),
+        ]
+    )
+    billing.loc[cpu_rows, "usage_amount"] *= scale.reindex(key).to_numpy()
+    _recost(billing, cpu_rows)
+
+    # Service-wide extra instances per hour, averaged over the window.
+    extra_per_hour = (
+        pd.Series(new_instances - clean_instances)
+        .groupby(pd.DatetimeIndex(metrics.loc[rows, "hour"]).to_numpy())
+        .sum()
+    )
+    return {"instance_count_delta": float(extra_per_hour.mean())}
+
+
+_MUTATIONS = {
+    IncidentType.LOGGING_REGRESSION: _inject_logging_regression,
+    IncidentType.QUERY_REGRESSION: _inject_query_regression,
+    IncidentType.IDLE_ACCELERATOR: _inject_idle_accelerator,
+    IncidentType.AUTOSCALING_ERROR: _inject_autoscaling_error,
+}
+
+
 def inject(
     incident_type: IncidentType,
     service: Service,
