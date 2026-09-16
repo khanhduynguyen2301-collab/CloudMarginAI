@@ -395,6 +395,68 @@ _MUTATIONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# causal event
+# ---------------------------------------------------------------------------
+
+
+def _causal_event(
+    incident_type: IncidentType,
+    service: Service,
+    start_ts: pd.Timestamp,
+    ordinal: int,
+    rng: np.random.Generator,
+) -> DeploymentRow | ResourceChangeRow:
+    """The change that caused this incident, tagged with its reserved value.
+
+    Lands CAUSAL_LEAD_HOURS_LOW..HIGH hours before the incident starts;
+    place_incidents guarantees there is room for that lead inside the split.
+    """
+    table, reserved = CAUSAL_EVENT_TAG[incident_type]
+    lead = int(rng.integers(CAUSAL_LEAD_HOURS_LOW, CAUSAL_LEAD_HOURS_HIGH + 1))
+    at = pd.Timestamp(start_ts) - pd.Timedelta(hours=lead)
+    actor = str(rng.choice(CAUSAL_ACTORS))
+
+    if table == "deployments":
+        return DeploymentRow(
+            organization_id=ORGANIZATION_ID,
+            service=service.name,
+            deployment_id=f"dep-{service.name}-{CAUSAL_DEPLOYMENT_ID_OFFSET + ordinal:04d}",
+            released_at=at,
+            version=f"v2.{ordinal}.0",
+            changed_component=reserved,
+            actor=actor,
+            schema_version=SCHEMA_VERSION,
+            ingested_at=at,
+        )
+
+    # resource_changes is resource-grained, but both incidents it carries are
+    # policy changes that apply to the whole service. The row is attached to the
+    # primary-region resource, so Phase 3 must score an autoscaling cause at
+    # SERVICE level rather than by exact resource match. See decisions.md.
+    params = capacity_params_for(service)
+    primary = max(params.region_weights, key=lambda r: (params.region_weights[r], r))
+    if reserved == "schedule_removed":
+        before = {"schedule": "0 2 * * *", "auto_stop": True}
+        after = {"schedule": None, "auto_stop": False}
+    else:
+        before = {"min_replicas": params.min_replicas}
+        after = {"min_replicas": min(params.min_replicas * 4, params.max_replicas)}
+
+    return ResourceChangeRow(
+        organization_id=ORGANIZATION_ID,
+        project_id=service.project,
+        resource_id=resource_id_for(service, primary),
+        changed_at=at,
+        change_type=reserved,
+        actor=actor,
+        before_config=before,
+        after_config=after,
+        schema_version=SCHEMA_VERSION,
+        ingested_at=at,
+    )
+
+
 def inject(
     incident_type: IncidentType,
     service: Service,
