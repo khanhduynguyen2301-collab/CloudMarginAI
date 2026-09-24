@@ -167,3 +167,27 @@ def read_ground_truth(output_dir: Path) -> list[GroundTruthIncidentRow]:
     with path.open(encoding="utf-8") as handle:
         return [_from_record(json.loads(line)) for line in handle if line.strip()]
 
+
+def manifest_entries(rows: list[GroundTruthIncidentRow]) -> list[dict]:
+    """The injected-incident list for manifest.json - WITHOUT magnitudes.
+
+    Convention 20. simulator-architecture.md is explicit that the manifest names
+    incidents by ID only, so a magnitude exists in exactly one file. Everything
+    kept here is already knowable from the data itself - that an incident
+    happened, where, and when. What stays behind is the answer key: how big it
+    was.
+
+    cli.py should call this rather than building the list inline, so the rule
+    lives next to the data it protects.
+    """
+    return [
+        {
+            "ground_truth_id": row.ground_truth_id,
+            "incident_type": row.incident_type,
+            "affected_service_or_resource": row.affected_service_or_resource,
+            "injected_at": pd.Timestamp(row.injected_at).isoformat(),
+            "duration_hours": int(row.duration_hours),
+            "chronological_split": row.chronological_split,
+        }
+        for row in rows
+    ]
