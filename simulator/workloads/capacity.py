@@ -35,6 +35,7 @@ Four conventions this module fixes, on top of the four in demand.py:
 Returns a LONG frame — one row per (resource_id, hour) — unlike demand.py, which
 returns one row per hour.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -80,25 +81,23 @@ class CapacityParams:
     are ignored for demand-driven services.
     """
 
-    capacity_per_instance: float   # requests/hour one instance absorbs at 100% CPU
-    target_utilization: float      # autoscaler setpoint; doc range 0.55-0.70
-    min_replicas: int              # the autoscaling incident multiplies THIS 3-5x
+    capacity_per_instance: float  # requests/hour one instance absorbs at 100% CPU
+    target_utilization: float  # autoscaler setpoint; doc range 0.55-0.70
+    min_replicas: int  # the autoscaling incident multiplies THIS 3-5x
     max_replicas: int
     base_latency_p50_ms: float
-    p99_multiplier: float          # p99 = p50 * this, before congestion
-    base_error_rate: float         # errors per request; Poisson mean
-    memory_baseline: float         # 0-1; memory is far less demand-elastic than CPU
+    p99_multiplier: float  # p99 = p50 * this, before congestion
+    base_error_rate: float  # errors per request; Poisson mean
+    memory_baseline: float  # 0-1; memory is far less demand-elastic than CPU
     memory_elasticity: float = 0.25  # how much of a CPU swing memory follows
-    region_weights: dict[str, float] = field(
-        default_factory=lambda: dict(DEFAULT_REGION_WEIGHTS)
-    )
+    region_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_REGION_WEIGHTS))
     sigma_cpu: float = 0.03
     sigma_latency: float = 0.05
     sigma_memory: float = 0.02
 
     # --- BATCH_ACCELERATOR only ---
     gpu_count: int = 0
-    job_window_utc: tuple[int, int] = (2, 6)   # [start, end) hour, UTC
+    job_window_utc: tuple[int, int] = (2, 6)  # [start, end) hour, UTC
     gpu_utilization_active: float = 0.85
 
 
@@ -199,9 +198,7 @@ def params_for(service: Service) -> CapacityParams:
 
     total = sum(base.region_weights.values())
     if abs(total - 1.0) > _WEIGHT_TOLERANCE:
-        raise ValueError(
-            f"region weights for {service.name!r} sum to {total!r}, expected 1.0"
-        )
+        raise ValueError(f"region weights for {service.name!r} sum to {total!r}, expected 1.0")
 
     if service.project == "prod":
         return base
@@ -337,9 +334,9 @@ def generate_capacity_and_reliability(
         regional = requests * weight
 
         needed = regional / (params.capacity_per_instance * params.target_utilization)
-        instance_count = np.clip(
-            np.ceil(needed), params.min_replicas, params.max_replicas
-        ).astype(np.int64)
+        instance_count = np.clip(np.ceil(needed), params.min_replicas, params.max_replicas).astype(
+            np.int64
+        )
 
         # Derived back from instance_count, so utilization hovers near the
         # setpoint and only wobbles from ceil rounding. That flatness is correct
@@ -351,9 +348,7 @@ def generate_capacity_and_reliability(
         memory = params.memory_baseline + params.memory_elasticity * (
             cpu - params.target_utilization
         )
-        memory = np.clip(
-            memory * unit_mean_lognormal(rng, params.sigma_memory, n), 1e-4, 1.0
-        )
+        memory = np.clip(memory * unit_mean_lognormal(rng, params.sigma_memory, n), 1e-4, 1.0)
 
         congestion = _congestion(cpu, params.target_utilization)
         p50 = (

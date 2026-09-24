@@ -198,9 +198,7 @@ def test_gpu_hours_equal_the_running_gpu_count(org, hours):
     _, metrics, billing = _pipeline(service, hours)
     gpu = billing[billing.sku == "compute.gpu-hour"]
     # usage carries lognormal noise; compare totals within a few percent.
-    assert gpu.usage_amount.sum() == pytest.approx(
-        metrics.instance_count.sum(), rel=0.02
-    )
+    assert gpu.usage_amount.sum() == pytest.approx(metrics.instance_count.sum(), rel=0.02)
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +222,7 @@ def test_params_for_rejects_unknown_service(org):
 def test_staging_stores_less_but_bills_the_same_intensities(org):
     prod = params_for(org.get_service("checkout-api", project="prod"))
     staging = params_for(org.get_service("checkout-api", project="staging"))
-    assert staging.storage_base_gb == pytest.approx(
-        prod.storage_base_gb * STAGING_STORAGE_SCALE
-    )
+    assert staging.storage_base_gb == pytest.approx(prod.storage_base_gb * STAGING_STORAGE_SCALE)
     assert staging.log_kb_per_request == prod.log_kb_per_request
     assert staging.db_cpu_ms_per_request == prod.db_cpu_ms_per_request
 
@@ -324,9 +320,7 @@ def test_cost_per_request_is_stable_on_clean_weekdays(org, hours):
     unit_cost = cost_by_day / req_by_day
 
     assert unit_cost.std() / unit_cost.mean() < 0.05
-    assert unit_cost.iloc[-5:].mean() == pytest.approx(
-        unit_cost.iloc[:5].mean(), rel=0.10
-    )
+    assert unit_cost.iloc[-5:].mean() == pytest.approx(unit_cost.iloc[:5].mean(), rel=0.10)
 
 
 def test_no_service_bills_zero(all_billing):

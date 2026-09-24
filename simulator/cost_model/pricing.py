@@ -7,6 +7,7 @@ Illustrative GCP-like rates — never present these as real GCP pricing
 Fully implemented — this is a declarative table, not a design decision
 left for the generators.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
