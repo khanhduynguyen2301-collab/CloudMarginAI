@@ -45,12 +45,30 @@ import numpy as np
 import pandas as pd
 
 from simulator.schema import GroundTruthIncidentRow
+from datetime import datetime
+from typing import Union, get_args, get_origin, get_type_hints
 
 # Convention 18: a subdirectory, not a sibling of the analytical tables.
 GROUND_TRUTH_DIRNAME = "ground_truth"
 GROUND_TRUTH_FILENAME = "ground_truth_incidents.jsonl"
 
-_TIMESTAMP_FIELDS = ("injected_at",)
+def _timestamp_fields(cls) -> tuple[str, ...]:
+    """Field names whose type is (or may be) a datetime — derived from the
+    dataclass rather than hardcoded, so adding a timestamp to
+    GroundTruthIncidentRow cannot leave this module behind.
+
+    Handles Optional[datetime] too: schema.py already has one optional field,
+    and the next timestamp added is as likely to be nullable as not.
+    """
+    out = []
+    for name, hint in get_type_hints(cls).items():
+        candidates = get_args(hint) if get_origin(hint) is Union else (hint,)
+        if any(isinstance(c, type) and issubclass(c, datetime) for c in candidates):
+            out.append(name)
+    return tuple(out)
+
+
+_TIMESTAMP_FIELDS = _timestamp_fields(GroundTruthIncidentRow)
 
 
 def ground_truth_path(output_dir: Path) -> Path:
