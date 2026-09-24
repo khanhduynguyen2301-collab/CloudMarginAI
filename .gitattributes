@@ -1,0 +1,4 @@
+# Store all text files with LF endings, and check them out as LF.
+* text=auto eol=lf
+# Binary outputs: never touch their bytes.
+*.parquet binary
