@@ -10,14 +10,13 @@ corrupt any growth rate Phase 2 tries to recover.
 See docs/phase1/decisions.md, "Lognormal noise is corrected to mean exactly
 1.0".
 """
+
 from __future__ import annotations
 
 import numpy as np
 
 
-def unit_mean_lognormal(
-    rng: np.random.Generator, sigma: float, size: int
-) -> np.ndarray:
+def unit_mean_lognormal(rng: np.random.Generator, sigma: float, size: int) -> np.ndarray:
     """Multiplicative lognormal noise with mean exactly 1.0.
 
     Args:

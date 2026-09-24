@@ -13,6 +13,7 @@ another module's random stream."
 
 This file is fully implemented — it's plumbing, not a design decision.
 """
+
 from __future__ import annotations
 
 import hashlib
