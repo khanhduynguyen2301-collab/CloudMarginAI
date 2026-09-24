@@ -20,6 +20,7 @@ business-hours-clustered the way releases are: half of them are automated
 housekeeping, and the rest are as likely to happen while someone is poking at a
 console at 22:00 as at midday.
 """
+
 from __future__ import annotations
 
 import numpy as np

@@ -5,6 +5,7 @@ STATISTICAL for what only holds in expectation. Two tests here exist
 specifically to protect incident detectability in Phase 3 — see
 test_instance_count_is_never_pinned and test_batch_service_has_a_duty_cycle.
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -62,10 +63,7 @@ def _metrics_for(service, hours, seed: int = 42):
 
 
 def _demand_driven(org):
-    return [
-        s for s in org.all_services()
-        if s.resource_kind is not ResourceKind.BATCH_ACCELERATOR
-    ]
+    return [s for s in org.all_services() if s.resource_kind is not ResourceKind.BATCH_ACCELERATOR]
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +140,7 @@ def test_staging_replica_bounds_are_scaled_down(org):
 def test_resource_id_includes_project_so_prod_and_staging_never_collide(org):
     """prod and staging both contain web-frontend and checkout-api."""
     prod = resource_id_for(org.get_service("web-frontend", project="prod"), "us-central1")
-    staging = resource_id_for(
-        org.get_service("web-frontend", project="staging"), "us-central1"
-    )
+    staging = resource_id_for(org.get_service("web-frontend", project="staging"), "us-central1")
     assert prod != staging
 
 
@@ -301,9 +297,9 @@ def test_cpu_hovers_near_the_autoscaler_setpoint(org, hours):
     for service in _demand_driven(org):
         params = params_for(service)
         df = _metrics_for(service, hours)
-        assert df.cpu_utilization.median() == pytest.approx(
-            params.target_utilization, rel=0.25
-        ), service.name
+        assert df.cpu_utilization.median() == pytest.approx(params.target_utilization, rel=0.25), (
+            service.name
+        )
 
 
 def test_latency_rises_with_cpu_pressure(org, hours):

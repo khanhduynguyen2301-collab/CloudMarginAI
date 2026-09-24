@@ -1,6 +1,7 @@
 """Working example test — topology.py is fully implemented, so this passes
 today.
 """
+
 from simulator.topology import INCIDENT_SERVICE_MAP, ORGANIZATION_ID, build_topology
 
 

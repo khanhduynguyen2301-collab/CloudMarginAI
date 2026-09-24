@@ -6,6 +6,7 @@ implemented — this is a declarative table (magnitude ranges, durations,
 which service each type targets), not a design decision left for
 incidents/engine.py.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

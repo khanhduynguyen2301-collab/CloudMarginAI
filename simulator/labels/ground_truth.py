@@ -36,21 +36,26 @@ bytes.
 from __future__ import annotations
 
 import json
+import types
 from collections import Counter
 from dataclasses import fields
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import numpy as np
 import pandas as pd
 
 from simulator.schema import GroundTruthIncidentRow
-from datetime import datetime
-from typing import Union, get_args, get_origin, get_type_hints
 
 # Convention 18: a subdirectory, not a sibling of the analytical tables.
 GROUND_TRUTH_DIRNAME = "ground_truth"
 GROUND_TRUTH_FILENAME = "ground_truth_incidents.jsonl"
+
+# typing.Optional[X] and PEP 604's `X | None` are different origins before
+# Python 3.14; a check against only one silently skips the other.
+_UNION_ORIGINS = (Union, types.UnionType)
+
 
 def _timestamp_fields(cls) -> tuple[str, ...]:
     """Field names whose type is (or may be) a datetime — derived from the
@@ -62,7 +67,7 @@ def _timestamp_fields(cls) -> tuple[str, ...]:
     """
     out = []
     for name, hint in get_type_hints(cls).items():
-        candidates = get_args(hint) if get_origin(hint) is Union else (hint,)
+        candidates = get_args(hint) if get_origin(hint) in _UNION_ORIGINS else (hint,)
         if any(isinstance(c, type) and issubclass(c, datetime) for c in candidates):
             out.append(name)
     return tuple(out)

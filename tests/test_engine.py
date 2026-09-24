@@ -100,9 +100,7 @@ def _clean_run(org, hours, seed: int) -> dict:
         d = generate_demand(
             s, hours, rng_for(seed, f"workload:{s.project}:{s.name}"), run_start=hours[0]
         )
-        m = generate_capacity_and_reliability(
-            s, d, rng_for(seed, f"capacity:{s.project}:{s.name}")
-        )
+        m = generate_capacity_and_reliability(s, d, rng_for(seed, f"capacity:{s.project}:{s.name}"))
         b = usage_to_billing_rows(
             s, d, m, rng_for(seed, f"cost_noise:{s.project}:{s.name}"), run_start=hours[0]
         )

@@ -29,6 +29,7 @@ and no incident in scope needs it. Storage grows slowly from a base, anchored
 on run_start (demand.py convention 4), so regenerating one window matches the
 full run's rows.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -157,9 +158,7 @@ def _storage_gb(
 ) -> np.ndarray:
     """Stored GB per hour: slow compounding growth from a base, anchored on run_start."""
     elapsed_days = np.asarray((hours - run_start) / pd.Timedelta(days=1), dtype=float)
-    return params.storage_base_gb * (1.0 + params.storage_growth_per_week) ** (
-        elapsed_days / 7.0
-    )
+    return params.storage_base_gb * (1.0 + params.storage_growth_per_week) ** (elapsed_days / 7.0)
 
 
 def _usage_by_sku(

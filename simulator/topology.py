@@ -9,6 +9,7 @@ If you need a different topology (more services, a second org, etc.),
 that's a doc change first (docs/phase1/simulator-architecture.md), then a
 code change here — never the other way around.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

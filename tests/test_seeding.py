@@ -2,6 +2,7 @@
 today. Use it as the pattern for tests you write against your own
 implementations (test_topology.py is the second worked example).
 """
+
 from simulator.seeding import derive_seed, rng_for
 
 

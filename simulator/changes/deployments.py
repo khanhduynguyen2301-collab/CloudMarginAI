@@ -25,6 +25,7 @@ Releases cluster in weekday business hours. That is realistic, and it makes
 temporal proximity a signal the ranker has to work for: an incident beginning at
 03:00 is much less likely to be deploy-caused than one beginning at 14:00.
 """
+
 from __future__ import annotations
 
 import numpy as np

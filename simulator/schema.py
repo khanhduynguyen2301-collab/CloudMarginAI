@@ -14,6 +14,7 @@ These dataclasses are fully implemented (they're structure, not logic) —
 generators in workloads/, cost_model/, changes/, incidents/, and labels/
 are what actually populate instances of them.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

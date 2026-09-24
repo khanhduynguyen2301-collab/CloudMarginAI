@@ -24,9 +24,9 @@ in two places and one of them is not protected.
 from __future__ import annotations
 
 import json
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from datetime import datetime
-from typing import Union, get_args, get_origin, get_type_hints
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,7 @@ from simulator.labels.ground_truth import (
     _TIMESTAMP_FIELDS,
     GROUND_TRUTH_DIRNAME,
     GROUND_TRUTH_FILENAME,
+    _timestamp_fields,
     ground_truth_path,
     manifest_entries,
     read_ground_truth,
@@ -269,17 +270,30 @@ def test_reading_an_unknown_field_raises(tmp_path, rows):
         read_ground_truth(tmp_path)
 
 
-def test_timestamp_fields_covers_every_datetime_in_the_schema():
-    """Drift guard. _TIMESTAMP_FIELDS is hardcoded; this fails the moment
-    GroundTruthIncidentRow gains a datetime that is not listed - which would
-    otherwise only surface as a TypeError during a real run, with a message
-    pointing at the wrong fix."""
-    expected = set()
-    for name, hint in get_type_hints(GroundTruthIncidentRow).items():
-        candidates = get_args(hint) if get_origin(hint) is Union else (hint,)
-        if any(isinstance(c, type) and issubclass(c, datetime) for c in candidates):
-            expected.add(name)
-    assert set(_TIMESTAMP_FIELDS) == expected
+@dataclass
+class _Probe:
+    """Every spelling a future timestamp field might plausibly use."""
+
+    plain: datetime
+    optional: Optional[datetime]
+    pep604: datetime | None
+    timestamp: pd.Timestamp
+    not_a_time: Optional[str]
+    count: int
+    payload: dict
+
+
+def test_timestamp_fields_detects_every_spelling_of_a_datetime():
+    """The helper is only self-maintaining if it recognises how the next field
+    will actually be written. `datetime | None` is the idiomatic spelling on
+    3.10+, and before 3.14 its union origin differs from Optional's - so a check
+    against only one silently skips the other, and the field's first real value
+    fails serialization at runtime, possibly phases later."""
+    assert _timestamp_fields(_Probe) == ("plain", "optional", "pep604", "timestamp")
+
+
+def test_the_schema_resolves_to_its_one_timestamp():
+    assert _TIMESTAMP_FIELDS == ("injected_at",)
 
 
 # ---------------------------------------------------------------------------
