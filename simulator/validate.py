@@ -143,8 +143,41 @@ MAGNITUDE_KEYS: frozenset[str] = frozenset(
         "instance_count_delta",
     }
 )
- 
 
+ 
+# ---------------------------------------------------------------------------
+# Causal-check tolerances (measured; see module docstring)
+# ---------------------------------------------------------------------------
+ 
+BASELINE_WEEK_SHIFTS: tuple[int, ...] = (-1, 1, -2, 2, -3, 3, -4, 4)
+ 
+# requests ratio, window vs baseline. Observed 0.977-1.054.
+TRAFFIC_FLAT_TOL = 0.10
+# implied / declared log multiplier. Observed within 0.8%.
+LOG_MULTIPLIER_RTOL = 0.05
+# measured / declared, for p99 latency and total service cost. Observed within
+# 1.6% and 4.3%.
+LATENCY_RTOL = 0.10
+COST_RTOL = 0.10
+# measured / declared idle cost per hour. Observed within 0.5%.
+IDLE_COST_RTOL = 0.05
+# per-hour GPU-hour usage vs the pool size. Observed up to 14.8% (one hour in
+# ~5,000, at sigma_usage 0.04 - a ~3.7 sigma draw).
+GPU_USAGE_RTOL = 0.25
+# Measured excess over 1.0 must reach this fraction of the spec's minimum excess.
+# The weakest db.cpu ratio observed was 1.829 against a 1.8 floor.
+RISE_FRACTION = 0.8
+# "GPU utilization held below 5%". engine.py clips AT 0.05, and exactly 0.05
+# occurs, so the bound is inclusive.
+IDLE_GPU_UTILIZATION_MAX = 0.05
+# reconstruction of effective_cost from usage x price
+RECONSTRUCTION_RTOL = 1e-9
+ 
+_MESSAGE_CAP = 10  # row-level failures are summarised past this many examples
+ 
+_UNION_ORIGINS = (Union, types.UnionType)
+ 
+ 
 # ---------------------------------------------------------------------------
 # Data-quality gates (validation-plan.md, "Data-quality gates")
 # ---------------------------------------------------------------------------
