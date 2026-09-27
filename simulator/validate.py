@@ -229,43 +229,260 @@ def _resource_kinds() -> dict[tuple[str, str], ResourceKind]:
 # ---------------------------------------------------------------------------
 # Data-quality gates (validation-plan.md, "Data-quality gates")
 # ---------------------------------------------------------------------------
-
-
+ 
+ 
 def check_schema(tables: dict[str, pd.DataFrame]) -> list[str]:
     """Every output row matches its table's field set/types in
-    docs/phase0/schema-v1.md / docs/phase0/incident-catalogue.md."""
-    raise NotImplementedError
-
-
+    docs/phase0/schema-v1.md / docs/phase0/incident-catalogue.md.
+ 
+    Field sets and types come from schema.py, the typed mirror of the frozen
+    docs. Also refuses any table not in TABLE_ROWS - most importantly ground
+    truth, which must never travel alongside the analytical tables.
+    """
+    failures: list[str] = []
+    for name in sorted(set(tables) - set(TABLE_ROWS)):
+        if "ground" in name or "truth" in name:
+            failures.append(
+                f"{name!r} is bundled with the analytical tables - ground truth must be "
+                "written separately (labels/ground_truth.py convention 18), never passed here"
+            )
+        else:
+            failures.append(f"unexpected table {name!r}; expected only {sorted(TABLE_ROWS)}")
+ 
+    for name, row_type in TABLE_ROWS.items():
+        if name not in tables:
+            failures.append(f"missing table {name!r}")
+            continue
+        frame = tables[name]
+        expected = [f for f in get_type_hints(row_type)]
+        missing = [c for c in expected if c not in frame.columns]
+        extra = [c for c in frame.columns if c not in expected]
+        if missing:
+            failures.append(f"{name}: missing columns {missing}")
+        if extra:
+            failures.append(f"{name}: columns not in the schema {extra}")
+        if frame.empty:
+            failures.append(f"{name}: table is empty")
+            continue
+        for column, hint in get_type_hints(row_type).items():
+            if column not in frame.columns:
+                continue
+            base, _ = _unwrap(hint)
+            problem = _dtype_problem(frame[column], base)
+            if problem:
+                failures.append(f"{name}.{column}: {problem}")
+ 
+    billing = tables.get("billing_hourly")
+    if billing is not None and "source" in billing.columns:
+        bad = set(billing["source"].dropna().unique()) - {"estimated", "billing_export"}
+        if bad:
+            failures.append(f"billing_hourly.source has values outside the schema enum: {bad}")
+    return failures
+ 
+ 
 def check_uniqueness(tables: dict[str, pd.DataFrame]) -> list[str]:
     """No duplicate rows on each table's declared grain (e.g.
     project-service-SKU-region-hour for billing_hourly)."""
-    raise NotImplementedError
-
-
+    failures: list[str] = []
+    for name, grain in TABLE_GRAIN.items():
+        frame = tables.get(name)
+        if frame is None or not set(grain) <= set(frame.columns):
+            continue  # check_schema reports it
+        duplicated = frame[frame.duplicated(list(grain), keep=False)]
+        if not duplicated.empty:
+            keys = duplicated[list(grain)].drop_duplicates().head(_MESSAGE_CAP)
+            examples = [tuple(row) for row in keys.itertuples(index=False)]
+            failures.append(
+                f"{name}: {len(duplicated)} rows share a grain key {grain}; e.g. {examples}"
+            )
+    return failures
+ 
+ 
 def check_nulls(tables: dict[str, pd.DataFrame]) -> list[str]:
-    """No unexpected nulls outside the documented nullable fields
-    (revenue, and any explicitly-nullable ground-truth fields)."""
-    raise NotImplementedError
-
-
+    """No unexpected nulls outside the documented nullable fields.
+ 
+    `revenue` may always be null. gpu_utilization must be null for exactly the
+    services with no GPU, and latency must be null for exactly the batch jobs -
+    see ALWAYS_NULLABLE for why the converse matters.
+    """
+    failures: list[str] = []
+    for name, frame in tables.items():
+        if name not in TABLE_ROWS:
+            continue
+        allowed = ALWAYS_NULLABLE.get(name, frozenset())
+        conditional = (
+            {_GPU_COLUMN, *_LATENCY_COLUMNS} if name == "resource_metrics_hourly" else set()
+        )
+        for column in frame.columns:
+            if column in allowed or column in conditional:
+                continue
+            n = int(frame[column].isna().sum())
+            if n:
+                failures.append(f"{name}.{column}: {n} unexpected null(s)")
+ 
+    metrics = tables.get("resource_metrics_hourly")
+    if metrics is None or not {"project_id", "service", _GPU_COLUMN}.issubset(metrics.columns):
+        return failures
+    kinds = _resource_kinds()
+    for (project, service), group in metrics.groupby(["project_id", "service"], sort=True):
+        kind = kinds.get((project, service))
+        if kind is None:
+            continue  # check_referential_integrity reports it
+        is_batch = kind is ResourceKind.BATCH_ACCELERATOR
+        gpu_null = group[_GPU_COLUMN].isna()
+        if is_batch and gpu_null.any():
+            failures.append(
+                f"{project}/{service}: {int(gpu_null.sum())} null gpu_utilization on a GPU service"
+            )
+        if not is_batch and not gpu_null.all():
+            failures.append(
+                f"{project}/{service}: gpu_utilization is set on a service with no GPU - a value "
+                "here reads as an idle accelerator"
+            )
+        for column in _LATENCY_COLUMNS:
+            if column in group.columns and not is_batch and group[column].isna().any():
+                failures.append(
+                    f"{project}/{service}: {int(group[column].isna().sum())} null {column} on a "
+                    "request-serving service"
+                )
+    return failures
+ 
+ 
 def check_cost_signs(billing: pd.DataFrame) -> list[str]:
-    """usage_amount, effective_cost, credits are all >= 0."""
-    raise NotImplementedError
-
-
+    """usage_amount, effective_cost, credits are all >= 0 - and finite, since an
+    infinite cost passes `>= 0` and would poison every sum downstream."""
+    failures: list[str] = []
+    for column in ("usage_amount", "effective_cost", "credits"):
+        if column not in billing.columns:
+            continue
+        values = billing[column].to_numpy(dtype=float)
+        negative = int((values < 0).sum())
+        non_finite = int((~np.isfinite(values)).sum())
+        if negative:
+            failures.append(f"billing_hourly.{column}: {negative} negative value(s)")
+        if non_finite:
+            failures.append(f"billing_hourly.{column}: {non_finite} non-finite value(s)")
+    return failures
+ 
+ 
 def check_unit_consistency(billing: pd.DataFrame) -> list[str]:
     """Every SKU's usage_unit matches simulator.cost_model.pricing.SKU_PRICES;
     no mixed units within a SKU."""
-    raise NotImplementedError
-
-
+    failures: list[str] = []
+    if not {"sku", "usage_unit"}.issubset(billing.columns):
+        return failures
+    for sku, units in billing.groupby("sku")["usage_unit"].unique().items():
+        if sku not in SKU_PRICES:
+            failures.append(f"billing_hourly: SKU {sku!r} is not in the price table")
+            continue
+        if len(units) > 1:
+            failures.append(f"billing_hourly: SKU {sku!r} mixes units {sorted(units)}")
+        elif units[0] != SKU_PRICES[sku].usage_unit:
+            failures.append(
+                f"billing_hourly: SKU {sku!r} billed in {units[0]!r}, "
+                f"price table says {SKU_PRICES[sku].usage_unit!r}"
+            )
+    return failures
+ 
+ 
+def _find_magnitude_keys(obj: Any, path: str = "manifest") -> list[str]:
+    hits: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in MAGNITUDE_KEYS or "magnitude" in str(key):
+                hits.append(f"{path}.{key}")
+            hits.extend(_find_magnitude_keys(value, f"{path}.{key}"))
+    elif isinstance(obj, (list, tuple)):
+        for i, value in enumerate(obj):
+            hits.extend(_find_magnitude_keys(value, f"{path}[{i}]"))
+    return hits
+ 
+ 
 def check_lineage(tables: dict[str, pd.DataFrame], manifest: dict) -> list[str]:
-    """Every row carries organization_id and schema_version; the run
-    carries a manifest.json (seed, split boundaries, incident list)."""
-    raise NotImplementedError
-
-
+    """Every row carries organization_id and schema_version; the run carries a
+    manifest.json (seed, split boundaries, incident list).
+ 
+    Also: ingested_at equals each row's own event time (convention 11 - the
+    clock never enters the pipeline), and the manifest carries no ground-truth
+    magnitude anywhere (convention 20).
+    """
+    failures: list[str] = []
+    for name, frame in tables.items():
+        if name not in TABLE_ROWS:
+            continue
+        if "organization_id" in frame.columns:
+            wrong = set(frame["organization_id"].dropna().unique()) - {ORGANIZATION_ID}
+            if wrong:
+                failures.append(
+                    f"{name}: organization_id values other than {ORGANIZATION_ID!r}: {wrong}"
+                )
+        if "schema_version" in frame.columns:
+            versions = frame["schema_version"].dropna().unique()
+            if len(versions) != 1 or not str(versions[0]).strip():
+                failures.append(
+                    f"{name}: expected one non-empty schema_version, got {list(versions)}"
+                )
+        event = EVENT_TIME_COLUMN.get(name)
+        if event and {"ingested_at", event}.issubset(frame.columns):
+            drift = int((frame["ingested_at"] != frame[event]).sum())
+            if drift:
+                failures.append(
+                    f"{name}: {drift} row(s) where ingested_at != {event} - wall-clock time has "
+                    "entered the pipeline, which breaks the byte-identical rerun"
+                )
+ 
+    if not isinstance(manifest, dict):
+        return failures + ["manifest is missing or not a JSON object"]
+    missing = [k for k in REQUIRED_MANIFEST_KEYS if k not in manifest]
+    if missing:
+        failures.append(f"manifest.json is missing {missing}")
+    leaks = _find_magnitude_keys(manifest)
+    if leaks:
+        failures.append(
+            f"manifest.json carries ground-truth magnitude at {leaks} - it must exist only in "
+            "ground_truth_incidents (labels/ground_truth.py convention 20)"
+        )
+    return failures
+ 
+ 
+def check_referential_integrity(tables: dict[str, pd.DataFrame]) -> list[str]:
+    """Every service, project and resource referenced anywhere exists.
+ 
+    Not in validation-plan.md's list, and added deliberately: Phase 3 cites a
+    config change by joining resource_changes.resource_id to the resource whose
+    metrics moved. An orphaned id does not raise anywhere - the join just comes
+    back empty and the ranker looks worse for no reason.
+    """
+    failures: list[str] = []
+    topology = set(_resource_kinds())
+    prod_services = {name for project, name in topology if project == "prod"}
+ 
+    for name in ("billing_hourly", "resource_metrics_hourly"):
+        frame = tables.get(name)
+        if frame is None or not {"project_id", "service"}.issubset(frame.columns):
+            continue
+        seen = set(frame[["project_id", "service"]].drop_duplicates().itertuples(index=False))
+        unknown = {tuple(x) for x in seen} - topology
+        if unknown:
+            failures.append(f"{name}: (project, service) pairs not in the topology: {unknown}")
+ 
+    deployments = tables.get("deployments")
+    if deployments is not None and "service" in deployments.columns:
+        unknown = set(deployments["service"].unique()) - prod_services
+        if unknown:
+            failures.append(f"deployments: services not in prod: {unknown}")
+ 
+    metrics = tables.get("resource_metrics_hourly")
+    changes = tables.get("resource_changes")
+    if metrics is not None and changes is not None and "resource_id" in changes.columns:
+        orphans = set(changes["resource_id"].unique()) - set(metrics["resource_id"].unique())
+        if orphans:
+            failures.append(
+                f"resource_changes: resource_ids with no metrics: {_examples(sorted(orphans))}"
+            )
+    return failures
+ 
+ 
 # ---------------------------------------------------------------------------
 # Reproducibility test (validation-plan.md, "Reproducibility test")
 # ---------------------------------------------------------------------------
