@@ -177,6 +177,54 @@ _MESSAGE_CAP = 10  # row-level failures are summarised past this many examples
  
 _UNION_ORIGINS = (Union, types.UnionType)
  
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+ 
+ 
+def _unwrap(hint: Any) -> tuple[Any, bool]:
+    """(base type, nullable-by-annotation) for a schema.py field hint."""
+    if get_origin(hint) in _UNION_ORIGINS:
+        args = [a for a in get_args(hint) if a is not type(None)]
+        return args[0], True
+    return hint, False
+ 
+ 
+def _dtype_problem(series: pd.Series, base: Any) -> str | None:
+    """Why `series` cannot hold values of `base`, or None if it can."""
+    kind = series.dtype.kind
+    if base is float:
+        return None if kind == "f" else f"expected float, got {series.dtype}"
+    if base is int:
+        return None if kind in "iu" else f"expected integer, got {series.dtype}"
+    if base is bool:
+        return None if kind == "b" else f"expected bool, got {series.dtype}"
+    if base is datetime:
+        if not isinstance(series.dtype, pd.DatetimeTZDtype):
+            return f"expected tz-aware UTC timestamps, got {series.dtype}"
+        if str(series.dtype.tz) != "UTC":
+            return f"expected UTC, got tz={series.dtype.tz}"
+        return None
+    if base is str:
+        inferred = pd.api.types.infer_dtype(series, skipna=True)
+        return None if inferred in ("string", "empty") else f"expected strings, got {inferred}"
+    if base is dict:
+        if not series.map(lambda v: isinstance(v, dict)).all():
+            return "expected a dict (JSON object) in every row"
+        return None
+    return f"no dtype rule for annotation {base!r}"
+ 
+ 
+def _examples(values, cap: int = _MESSAGE_CAP) -> str:
+    values = list(values)
+    shown = ", ".join(str(v) for v in values[:cap])
+    return shown + (f", ... ({len(values) - cap} more)" if len(values) > cap else "")
+ 
+ 
+def _resource_kinds() -> dict[tuple[str, str], ResourceKind]:
+    return {(s.project, s.name): s.resource_kind for s in build_topology().all_services()}
+ 
  
 # ---------------------------------------------------------------------------
 # Data-quality gates (validation-plan.md, "Data-quality gates")
