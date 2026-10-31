@@ -488,10 +488,36 @@ def check_referential_integrity(tables: dict[str, pd.DataFrame]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _canonical(value: Any) -> Any:
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return value
+
+
 def hash_tables(tables: dict[str, pd.DataFrame]) -> dict[str, str]:
     """Row-order-independent hash per table (generation order isn't a
-    guaranteed contract) — used to compare two runs with the same seed."""
-    raise NotImplementedError
+    guaranteed contract) - used to compare two runs with the same seed.
+
+    Each row is hashed on its exact values (floats bit-for-bit: the plan asks
+    for byte-identical, not "statistically similar"), the row hashes are
+    sorted, and the sorted array is hashed together with the column names and
+    dtypes - so a change of type or a renamed column changes the hash even when
+    the values do not. JSON columns are canonicalised with sorted keys first.
+    """
+    out: dict[str, str] = {}
+    for name in sorted(tables):
+        frame = tables[name]
+        columns = sorted(frame.columns)
+        normalised = frame[columns].copy()
+        for column in columns:
+            if normalised[column].dtype.kind == "O":
+                normalised[column] = normalised[column].map(_canonical)
+        row_hashes = np.sort(pd.util.hash_pandas_object(normalised, index=False).to_numpy())
+        digest = hashlib.sha256()
+        digest.update(json.dumps([(c, str(frame[c].dtype)) for c in columns]).encode())
+        digest.update(row_hashes.tobytes())
+        out[name] = digest.hexdigest()
+    return out
 
 
 # ---------------------------------------------------------------------------
