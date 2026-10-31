@@ -249,3 +249,295 @@ name a `resource_id` as an incident's cause, and that string has to be
 reproducible. It must also include `project`: prod and staging both contain
 `web-frontend` and `checkout-api`, so a name without it collides across projects
 and would break the uniqueness gate in `validate.py`.
+
+---
+
+## 2026-09-13 — RESOLVED: demand fans out by fixed region weights, one resource per service-region
+
+**Settled in:** `simulator/workloads/capacity.py`, conventions (5)–(8).
+**Resolves** the OPEN entry "how does a service's demand fan out across
+regions?" above.
+
+Chosen: the simple candidate. Each service's hourly requests are split by fixed
+weights — `us-central1` 0.50, `us-east1` 0.30, `europe-west1` 0.20 — with exactly
+one resource per service-region. The variable resource pool was rejected: none of
+the four incident types needs it, and churning `resource_id`s would make Phase 3's
+"name the resource that caused this" harder to score.
+
+- `resource_id = f"{project}-{service}-{region}-{ordinal:03d}"`, derived from the
+  topology and never the rng, and including `project` so prod and staging cannot
+  collide.
+- Regions are iterated in `sorted()` order, so reordering the weights dict
+  cannot shift the random stream.
+- `ml-training-job` (BATCH_ACCELERATOR) runs in one region on a fixed schedule:
+  8 GPUs, 02:00–06:00 UTC, off otherwise. It does not follow demand.
+- **staging runs in one region** with replica bounds scaled by 0.10 (floors 1
+  and 2). Found while calibrating: staging carries 4% of prod's demand, and
+  splitting that three ways left `staging/checkout-api` in `europe-west1` below
+  one instance's worth of traffic for the whole run — pinned at `min_replicas`,
+  perfectly flat cost, and an undetectable autoscaling incident.
+
+**Constrains:** per-hour `request_count` summed over a service's resources
+matches demand within ±(number of regions), from rounding each region
+separately. `tests/test_capacity.py` enforces that every demand-driven service's
+`instance_count` actually varies.
+
+---
+
+## 2026-09-13 — Noise lands on usage, never on cost
+
+**Settled in:** `simulator/cost_model/billing.py`, conventions (9)–(11)
+
+Two specs conflicted. `workload-cost-model.md` asks for multiplicative lognormal
+cost noise; `validation-plan.md` asks that `effective_cost` reconstruct
+**exactly** from `usage_amount × unit_price × (1 − credit_rate)`. Both hold if
+the noise is applied to `usage_amount` and cost is then pure arithmetic on it —
+which is also how real billing works: metering is noisy, the arithmetic is not.
+Verified to 3.55e-15 across all 138,240 billing rows of a run.
+
+Two further rules from the same module:
+
+- `credits` is a **positive** discount magnitude (`effective_cost = list_cost −
+  credits`), because the cost-signs gate requires all three columns ≥ 0.
+- `ingested_at` is derived from the row's own `hour`, never the wall clock. One
+  `datetime.now()` anywhere breaks the byte-identical rerun.
+
+**Constrains:** every module that writes billing rows. `incidents/engine.py`
+inherits this as its convention (16).
+
+---
+
+## 2026-09-14 — Reserved causal vocabulary; deployments are prod-only
+
+**Settled in:** `simulator/changes/deployments.py`, conventions (12)–(13)
+
+- **(12)** `logging-config` and `query-layer` (in `deployments.changed_component`)
+  and `schedule_removed` and `update_scaling_policy` (in
+  `resource_changes.change_type`) are written **only** by
+  `incidents/engine.py`, to mark the change that caused an incident. If
+  background noise emitted them, Phase 3's ranker could find a true cause by
+  string match instead of by evidence, and its Top-3 accuracy would mean nothing.
+- **(13)** The frozen `deployments` schema has no `project_id`, and prod and
+  staging both contain `web-frontend` and `checkout-api`. A staging deploy would
+  be an ambiguous candidate cause for a prod incident, so deployments are
+  generated for prod only. Staging's change activity lives in `resource_changes`,
+  which does carry `project_id`.
+
+Expected volume per 90-day run, from the configured rates: ~74 background
+deployments (prod, one per 6–9 days per service) and ~81 background config
+changes (one per resource per 20 days, 18 resources) — roughly 7 benign deploys
+per injected incident, so "a change happened nearby" is not by itself evidence.
+Checked over 400 seeds: realized counts track these expectations within 2.5%.
+
+**Known schema gap, accepted:** `resource_changes` has no id column, so
+`(resource_id, changed_at)` is its de facto primary key — the only handle Phase 3
+has to cite a config change. `validate.py`'s uniqueness gate enforces it.
+
+---
+
+## 2026-09-16 — The injection engine is pure, ratio-based, and measures its own ground truth
+
+**Settled in:** `simulator/incidents/engine.py`, conventions (14)–(17)
+
+- **(14) Pure, and expressed as ratios.** `inject` never modifies its inputs;
+  it returns new frames. Inside the window it rescales each clean value by the
+  ratio the parameter change implies, rather than regenerating the window. That
+  keeps every hour's own noise draw, so the parameter is the only thing that
+  changes — regenerating would put a noise discontinuity at the window edge that
+  a detector could find for the wrong reason. The rewrite is exact because every
+  affected quantity is linear in its parameter. **One exception:** idle
+  accelerator off-hours have a clean GPU count of 0, where a ratio is undefined;
+  those hours get a fresh draw from the incidents stream.
+- **(15) Ground-truth magnitude is measured, not copied.** Only
+  `log_byte_multiplier` is the input parameter. `latency_delta_pct`,
+  `cost_delta_pct`, `idle_cost_rate` and `instance_count_delta` are outcomes,
+  measured by differencing injected against clean. The sampled input is
+  recoverable only by replaying `simulator_seed`.
+- **(16) Cost is recomputed from usage**, never scaled alongside it, so the
+  exact-reconstruction rule above holds inside incident windows too.
+- **(17) No incident touches demand.** `application_activity_hourly` is a clean
+  control series for the whole run — which denies Phase 3 a business-demand
+  shortcut.
+
+Also fixed here:
+
+- **Placement is a fixed allocation**, not sampled: train gets logging ×2,
+  query ×2, idle, autoscaling; validation gets query and idle; test gets
+  logging and autoscaling. 6/2/2 and "exactly one logging regression in test"
+  therefore hold for every seed. Starts are rejection-sampled, with ≥ 48 h
+  between incidents on the same service. Placement succeeded on 500/500 seeds.
+- **The causal event lands 1–3 hours before its incident**, never at the same
+  instant, so the true cause cannot be found with an equality join on time.
+- **Causal `deployment_id`s are provisional**, offset by 5000 so they cannot
+  collide with background ids (`dep-<service>-5001`, …). `cli.py` **must**
+  renumber all deployments chronologically when it merges the two streams, or
+  the offset becomes a tell of its own.
+- **An autoscaling cause is attached to the primary-region resource**, because
+  `resource_changes` is resource-grained but the policy change is service-wide.
+  Phase 3 must score an autoscaling cause at service level, not by exact
+  `resource_id` match.
+
+---
+
+## 2026-09-16 — FINDING: `autoscaling_error` often falls below the materiality bar
+
+**Found by:** `tests/test_engine.py`, recorded as `xfail(strict=True)` with the
+diagnosis in its reason string. **Feeds:** the OPEN materiality entry above.
+**Status:** fix not yet chosen.
+
+Across 25 seeds (50 autoscaling injections), **24 fell below $50/day** and 12
+below 5% of org-level expected cost (~$680/day, so a ~$34/day bar). The weakest
+was $17.5/day at a 3.27× floor. The other three types cleared both bars on every
+seed: logging regression ≥ $72.5/day, query regression ≥ $54.9/day, idle
+accelerator ≥ $316.8/day.
+
+The magnitude range is not the cause. `min_replicas = 4` is one global floor,
+while regions carry 50/30/20 of traffic. `us-central1`'s trough is ~7 instances,
+so a 3× floor of 12 lifts only **7.5% of its hours, by 0.17 instances on
+average** — and that region is half the spend. `europe-west1` is lifted 71% of
+the time, but it is 20% of the spend.
+
+Options:
+
+1. **Region-aware replica floor** in `capacity.py`, so each region's floor sits
+   near its own trough — what a real autoscaling floor is. Most principled;
+   shifts the clean baseline, so `tests/test_capacity.py` needs re-checking.
+2. Raise `recommendation-api`'s `vcpu_per_instance` (8 → ~14). Cheapest, but it
+   tunes a price to hit a threshold.
+3. Accept it, and stop counting sub-threshold incidents as detector misses in
+   Phase 2/3 scoring.
+
+Recommended: option 1.
+
+**Updates the OPEN materiality entry:** its proposed `validate.py` gate was not
+added. Materiality is currently enforced by `tests/test_engine.py` across 25
+seeds, not by the per-run gates.
+
+---
+
+## 2026-09-24 — Ground truth lives in its own subdirectory, as JSON Lines, and never in the manifest
+
+**Settled in:** `simulator/labels/ground_truth.py`, conventions (18)–(20)
+
+- **(18)** Written to `output_dir/ground_truth/ground_truth_incidents.jsonl`,
+  never beside the analytical tables. A detector that globs the run directory
+  structurally cannot reach it — a comment saying "don't read this" protects
+  nothing.
+- **(19)** JSON Lines, not parquet (overriding the stub's suggestion).
+  `expected_magnitude` has different keys per incident type, which a columnar
+  schema could only hold as a union struct full of nulls or an opaque JSON
+  string. It is ~10 rows, and an auditor can read it without a parquet reader.
+- **(20)** `manifest_entries()` builds the manifest's incident list **without**
+  magnitudes, per `simulator-architecture.md`. `cli.py` must use it rather than
+  building the list inline, so the rule lives next to the data it protects.
+
+Byte-identical across directories and across write → read → write. Written with
+`newline="\n"` so Windows produces the same bytes as CI.
+
+`_TIMESTAMP_FIELDS` is derived from the dataclass's type hints. That derivation
+must accept both `Optional[datetime]` and `datetime | None`: they are different
+union origins before Python 3.14, and checking only one silently skips the
+other; a probe test covers every spelling.
+
+---
+
+## 2026-09-24 — Line endings are LF, enforced by `.gitattributes`
+
+**Settled in:** `.gitattributes` (`* text=auto eol=lf`, `*.parquet binary`)
+
+Five test files pasted in on Windows had CRLF endings while the rest were LF.
+Source line endings do not change the simulator's output, but the mix grows
+with every paste and makes diffs noisy. The rule now lives in the repo rather
+than in each machine's personal git config, so every checkout gets the same
+bytes.
+
+---
+
+## 2026-09-24 — The validator re-derives everything from the output tables
+
+**Settled in:** `simulator/validate.py`, conventions (21)–(24)
+
+- **(21)** Every check reads only the assembled tables — no clean frames, no
+  generator internals. A causal check that asked `engine.py` what it did would
+  only prove `engine.py` agrees with itself.
+- **(22)** Each incident is compared with the same window shifted by ±1–4
+  **whole weeks** — the nearest shift inside the run and clear of every incident
+  on that service. Whole weeks cancel the daily and weekly cycles exactly;
+  dividing by the traffic ratio cancels growth. Tolerances were measured over
+  20 seeds (200 incidents) with ≥ 2× headroom, then checked: 60/60 seeds pass
+  every gate.
+- **(23)** `tables` is the contract for `cli.py`: the five analytical tables,
+  each with exactly its `schema.py` fields. Anything else — above all a
+  ground-truth frame — fails the schema gate.
+- **(24)** `run_all_gates` returns a `ValidationReport`, falsy on any failure,
+  with `summary()` for the CLI to print. A gate that raises is recorded as that
+  gate failing, so one broken table still yields a complete report.
+
+Two gates were added beyond `validation-plan.md`: **referential integrity**
+(every `resource_id` in `resource_changes` has metrics — an orphan makes Phase
+3's join silently empty) and **manifest vs ground truth**.
+
+**Constrains `cli.py`:**
+
+- `application_activity_hourly` is **prod-only**. Its grain is
+  product-service-hour with no `project_id`, so staging rows would duplicate
+  prod's keys — and staging has no real customers anyway.
+- `manifest.json` must carry `master_seed`, `derived_seeds`, `date_range`,
+  `split_boundaries`, `topology_version`, `cost_model_version` and `incidents`.
+
+---
+
+## 2026-09-24 — Spec errata found while writing `validate.py`
+
+**Settled in:** `simulator/validate.py`. **Action:** correct the specs.
+
+1. **Idle-accelerator billing.** `validation-plan.md` says `compute.gpu-hour`
+   usage stays "unchanged from baseline"; `incident-injection-spec.md` says it
+   "continues at its normal active rate" around the clock, which is what the
+   engine does — so total usage *rises*. Implemented the injection spec: every
+   window hour bills the full 8-GPU pool. Fix `validation-plan.md`.
+2. **Nullable fields.** The plan lists only `revenue` and `remediated_at`.
+   `gpu_utilization` must be null for services with no GPU (0.0 there would read
+   as an idle accelerator), and latency is null for the batch job. The gate
+   enforces both directions.
+3. **"Below 5%" means at or below.** The engine clips GPU utilization at exactly
+   0.05 and that value occurs, so the check is inclusive. Fix the wording — or
+   change the clip, not the check.
+4. **Two new gates** (referential integrity, manifest vs ground truth) belong in
+   the plan's gate list.
+
+---
+
+## 2026-10-31 — The two change generators need separate random streams
+
+**Found while:** writing these entries. **Constrains:** `cli.py`, and the
+docstrings of `changes/deployments.py` and `changes/resource_changes.py`.
+**Action:** change both docstrings before `cli.py` is written.
+
+Both docstrings currently say to seed with
+`rng_for(master_seed, f"changes:{project}:{name}")` — the same key. Called with
+two fresh Generators from that key, the two generators start from identical
+random numbers. Measured over 200 seeds of prod services:
+
+| Seeding | Config changes landing on a deploy hour | corr(# deploys, # changes) |
+|---|---|---|
+| Same key, two fresh Generators | 1.51% | **+0.62** |
+| Same Generator instance, used in turn | 0.48% | +0.14 |
+| Separate keys | 0.53% | +0.09 |
+
+The first row is the bug: a service with many deploys would also get many
+config changes, and the two would coincide three times as often — a spurious
+"change cluster" pattern that a Phase 3 ranker could learn. The residual +0.09
+in the last row is structural (services with more regions and faster release
+cadences have more of both), not stream sharing.
+
+Decided: separate keys, `deployments:{project}:{name}` and
+`resource_changes:{project}:{name}`. Sharing one Generator instance would also
+avoid most of the correlation, but it makes `resource_changes` depend on how many
+numbers `deployments` happened to draw — the iteration-order coupling the
+per-service-stream entry above exists to prevent.
+
+**Also settled for `cli.py`** — the full stream naming: `workload:`,
+`capacity:`, `cost_noise:`, `deployments:` and `resource_changes:`, each suffixed
+`{project}:{name}`, plus one `incidents` stream threaded through
+`place_incidents` and then every `inject` call, in placement order.
